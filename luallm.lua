@@ -30,13 +30,6 @@ local lfs = require("lfs")
 local CONFIG_DIR = os.getenv("HOME") .. "/.config/luaLLM"
 local CONFIG_FILE = CONFIG_DIR .. "/config.json"
 local HISTORY_FILE = CONFIG_DIR .. "/history.json"
-local EXAMPLE_CONFIG = arg[0]:match("(.*/)")  -- Get script directory
-if EXAMPLE_CONFIG then
-    EXAMPLE_CONFIG = EXAMPLE_CONFIG .. "config.example.json"
-else
-    -- If running from PATH, try to find it relative to script
-    EXAMPLE_CONFIG = "/usr/local/share/luallm/config.example.json"
-end
 
 -- Utility functions
 local function expand_path(path)
@@ -80,11 +73,15 @@ end
 local function load_config()
     ensure_config_dir()
     local config = load_json(CONFIG_FILE)
+    
     if not config then
-        -- Try to copy example config
-        if file_exists(EXAMPLE_CONFIG) then
+        -- Check if example config exists next to the script
+        local script_dir = arg[0]:match("(.*/)")
+        local example_config = script_dir and (script_dir .. "config.example.json") or "config.example.json"
+        
+        if file_exists(example_config) then
             print("No config found. Creating from example config...")
-            os.execute("cp " .. string.format("%q", EXAMPLE_CONFIG) .. " " .. string.format("%q", CONFIG_FILE))
+            os.execute("cp " .. string.format("%q", example_config) .. " " .. string.format("%q", CONFIG_FILE))
             config = load_json(CONFIG_FILE)
             if config then
                 print("Config created at: " .. CONFIG_FILE)
@@ -95,11 +92,17 @@ local function load_config()
                 os.exit(1)
             end
         else
-            print("Error: Could not find example config at: " .. EXAMPLE_CONFIG)
-            print("Please create a config file at: " .. CONFIG_FILE)
+            print("Error: No config file found.")
+            print()
+            print("Please create a config file at:")
+            print("  " .. CONFIG_FILE)
+            print()
+            print("You can find an example config (config.example.json) in the")
+            print("same directory as the luallm script, or create one manually.")
             os.exit(1)
         end
     end
+    
     return config
 end
 
@@ -115,23 +118,49 @@ end
 local function add_to_history(model_name)
     local history = load_history()
     
-    -- Remove if already exists
-    for i, name in ipairs(history) do
+    -- Remove if already exists (to update timestamp)
+    for i, entry in ipairs(history) do
+        local name = type(entry) == "string" and entry or entry.name
         if name == model_name then
             table.remove(history, i)
             break
         end
     end
     
-    -- Add to front
-    table.insert(history, 1, model_name)
+    -- Add to front with timestamp
+    table.insert(history, 1, {
+        name = model_name,
+        last_run = os.time()
+    })
     
-    -- Keep only last 4
-    while #history > 4 do
-        table.remove(history)
+    -- Keep all history, don't limit here
+    save_history(history)
+end
+
+local function get_recent_models(config)
+    local history = load_history()
+    local count = config.recent_models_count or 4
+    local recent = {}
+    
+    for i = 1, math.min(count, #history) do
+        table.insert(recent, history[i])
     end
     
-    save_history(history)
+    return recent
+end
+
+local function clear_history()
+    save_history({})
+end
+
+local function get_last_run_time(model_name, history)
+    for _, entry in ipairs(history) do
+        local name = type(entry) == "string" and entry or entry.name
+        if name == model_name then
+            return type(entry) == "table" and entry.last_run or nil
+        end
+    end
+    return nil
 end
 
 local function list_models(models_dir)
@@ -197,6 +226,60 @@ local function format_time(timestamp)
     return os.date("%b %d, %Y", timestamp)
 end
 
+local function print_model_list(models, models_dir)
+    if #models == 0 then
+        print("  No models found.")
+        return
+    end
+    
+    -- Load history to check for last run times
+    local history = load_history()
+    
+    -- Convert simple names to model objects if needed
+    local model_list = {}
+    for _, model in ipairs(models) do
+        if type(model) == "string" then
+            -- Simple name - need to get the file info
+            local filepath = expand_path(models_dir) .. "/" .. model .. ".gguf"
+            local attr = lfs.attributes(filepath)
+            local mtime = attr and attr.modification or 0
+            
+            -- Check if we have a last run time in history
+            local last_run = get_last_run_time(model, history)
+            if last_run then
+                mtime = last_run
+            end
+            
+            table.insert(model_list, {name = model, mtime = mtime})
+        else
+            -- Already a model object, check for last run time
+            local last_run = get_last_run_time(model.name, history)
+            if last_run then
+                model.mtime = last_run
+            end
+            table.insert(model_list, model)
+        end
+    end
+    
+    -- Sort by modification time, newest first
+    table.sort(model_list, function(a, b)
+        return a.mtime > b.mtime
+    end)
+    
+    -- Find longest model name for alignment
+    local max_len = 0
+    for _, model in ipairs(model_list) do
+        if #model.name > max_len then
+            max_len = #model.name
+        end
+    end
+    
+    for _, model in ipairs(model_list) do
+        local padding = string.rep(" ", max_len - #model.name)
+        print("  " .. model.name .. padding .. "  " .. format_time(model.mtime))
+    end
+end
+
 local function find_matching_override(model_name, overrides)
     for pattern, params in pairs(overrides) do
         if model_name:match(pattern) then
@@ -242,9 +325,7 @@ local function run_model(config, model_name, extra_args)
         print()
         print("Available models:")
         local models = list_models(config.models_dir)
-        for _, model in ipairs(models) do
-            print("  " .. model.name)
-        end
+        print_model_list(models, config.models_dir)
         os.exit(1)
     end
     
@@ -331,6 +412,13 @@ local function show_picker(models)
         return nil
     end
     
+    -- Convert history entries to just names for display
+    local model_names = {}
+    for _, entry in ipairs(models) do
+        local name = type(entry) == "string" and entry or entry.name
+        table.insert(model_names, name)
+    end
+    
     -- Save terminal state
     os.execute("stty -echo -icanon")
     
@@ -340,7 +428,7 @@ local function show_picker(models)
         io.write("\27[2J\27[H")
         print("Select a model (↑/↓ arrows, Enter to confirm, q to quit):\n")
         
-        for i, model in ipairs(models) do
+        for i, model in ipairs(model_names) do
             if i == selected then
                 io.write("  → \27[1m" .. model .. "\27[0m\n")
             else
@@ -360,10 +448,10 @@ local function show_picker(models)
             if next == "[" then
                 local arrow = io.read(1)
                 if arrow == "A" then -- Up
-                    selected = selected > 1 and selected - 1 or #models
+                    selected = selected > 1 and selected - 1 or #model_names
                     draw()
                 elseif arrow == "B" then -- Down
-                    selected = selected < #models and selected + 1 or 1
+                    selected = selected < #model_names and selected + 1 or 1
                     draw()
                 end
             end
@@ -371,7 +459,7 @@ local function show_picker(models)
             -- Restore terminal
             os.execute("stty echo icanon")
             io.write("\27[2J\27[H")
-            return models[selected]
+            return model_names[selected]
         elseif char == "q" or char == "Q" then
             -- Restore terminal
             os.execute("stty echo icanon")
@@ -387,13 +475,13 @@ local function main(args)
     
     if #args == 0 then
         -- Show interactive picker with recent models
-        local history = load_history()
-        if #history == 0 then
+        local recent = get_recent_models(config)
+        if #recent == 0 then
             print("No recent models. Use 'luallm list' to see available models.")
             os.exit(0)
         end
         
-        local selected = show_picker(history)
+        local selected = show_picker(recent)
         if selected then
             run_model(config, selected, nil)
         end
@@ -402,23 +490,7 @@ local function main(args)
         -- List all models
         local models = list_models(config.models_dir)
         print("Available models in " .. expand_path(config.models_dir) .. ":\n")
-        
-        if #models == 0 then
-            print("  No models found.")
-        else
-            -- Find longest model name for alignment
-            local max_len = 0
-            for _, model in ipairs(models) do
-                if #model.name > max_len then
-                    max_len = #model.name
-                end
-            end
-            
-            for _, model in ipairs(models) do
-                local padding = string.rep(" ", max_len - #model.name)
-                print("  " .. model.name .. padding .. "  " .. format_time(model.mtime))
-            end
-        end
+        print_model_list(models, config.models_dir)
         
     elseif args[1] == "config" then
         -- Show config file location
@@ -429,18 +501,24 @@ local function main(args)
         -- Rebuild llama.cpp
         rebuild_llama(config)
         
+    elseif args[1] == "clear-history" then
+        -- Clear run history
+        clear_history()
+        print("✓ History cleared")
+        
     elseif args[1] == "help" or args[1] == "--help" or args[1] == "-h" then
         -- Show help
         print("luaLLM - Local AI Model Manager")
         print()
         print("USAGE:")
-        print("  luallm              Interactive picker for recent models")
-        print("  luallm list         List all available models (sorted by date)")
-        print("  luallm <model>      Run a specific model")
-        print("  luallm <model> ...  Run model with custom llama.cpp flags")
-        print("  luallm config       Show config file location")
-        print("  luallm rebuild      Rebuild llama.cpp from source")
-        print("  luallm help         Show this help message")
+        print("  luallm                Interactive picker for recent models")
+        print("  luallm list           List all available models (sorted by date)")
+        print("  luallm <model>        Run a specific model")
+        print("  luallm <model> ...    Run model with custom llama.cpp flags")
+        print("  luallm config         Show config file location")
+        print("  luallm rebuild        Rebuild llama.cpp from source")
+        print("  luallm clear-history  Clear run history")
+        print("  luallm help           Show this help message")
         print()
         print("EXAMPLES:")
         print("  luallm                           # Pick from recent models")

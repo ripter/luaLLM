@@ -78,6 +78,7 @@ On first run, a config file is created at `~/.config/luaLLM/config.json`:
 - **llama_cpp_path**: Path to your llama-server binary
 - **llama_cpp_source_dir**: Path to llama.cpp git repository (for rebuilding)
 - **models_dir**: Directory containing your .gguf model files
+- **recent_models_count**: Number of recent models to show in picker (default: 4)
 - **default_params**: Default parameters passed to llama.cpp
 - **cmake_options**: CMake build flags used when rebuilding llama.cpp
 - **model_overrides**: Pattern-based overrides for specific models
@@ -131,6 +132,14 @@ luallm rebuild
 ```
 
 Pulls the latest changes from git and rebuilds llama.cpp with optimized settings (Metal, Flash Attention, etc.). Configure the source directory in your config file.
+
+### Clear Run History
+
+```bash
+luallm clear-history
+```
+
+Clears the history of models you've run. This resets the "last run" timestamps shown in the list.
 
 ## Model Overrides
 
