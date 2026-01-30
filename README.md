@@ -119,6 +119,20 @@ luallm llama-3-8b --port 9090 -c 8192
 
 Custom parameters override both defaults and model-specific overrides.
 
+### Show Model Info
+
+```bash
+luallm info llama-3-8b
+```
+
+Shows cached metadata about the model (context size, quantization, rope settings, etc.) without running it. The metadata is captured the first time you run a model.
+
+```bash
+luallm info llama-3-8b --raw
+```
+
+Shows the raw captured output lines.
+
 ### View Config Location
 
 ```bash
