@@ -1,0 +1,37 @@
+{
+  "llama_cpp_path": "/usr/local/bin/llama-server",
+  "llama_cpp_source_dir": "/home/user/llama.cpp",
+  "models_dir": "/home/user/models",
+  "default_params": [
+    "-c 4096",
+    "--port 8080",
+    "--host 127.0.0.1",
+    "--threads 8"
+  ],
+  "cmake_options": [
+    "-DGGML_METAL=ON",
+    "-DGGML_METAL_EMBED_LIBRARY=ON",
+    "-DGGML_USE_FLASH_ATTENTION=ON",
+    "-DLLAMA_BUILD_SERVER=ON",
+    "-DLLAMA_BUILD_EXAMPLES=ON",
+    "-DCMAKE_BUILD_TYPE=Release"
+  ],
+  "model_overrides": {
+    "codellama": [
+      "-c 16384",
+      "--gpu-layers 35"
+    ],
+    "llama%-3.*70b": [
+      "-c 8192",
+      "--gpu-layers 40",
+      "--threads 16"
+    ],
+    "mistral": [
+      "-c 8192"
+    ],
+    "phi": [
+      "-c 4096",
+      "--gpu-layers 32"
+    ]
+  }
+}
