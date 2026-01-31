@@ -122,10 +122,22 @@ Custom parameters override both defaults and model-specific overrides.
 ### Show Model Info
 
 ```bash
+luallm info
+```
+
+Shows an interactive picker of models with cached metadata. Use arrow keys to select a model and view its info.
+
+```bash
 luallm info llama-3-8b
 ```
 
-Shows cached metadata about the model (context size, quantization, rope settings, etc.) without running it. The metadata is captured the first time you run a model.
+Shows cached metadata about a specific model (context size, quantization, rope settings, etc.) without running it. The metadata is captured the first time you run a model.
+
+```bash
+luallm info llama-3-8b --kv
+```
+
+Shows the full structured KV dictionary for detailed comparison.
 
 ```bash
 luallm info llama-3-8b --raw

@@ -259,7 +259,8 @@ local function should_capture_line(line)
         "^llama_model_loader:",
         "^llama_model_load:",
         "^llama_new_context_with_model:",
-        "^llama_kv_cache_init:",
+        "^llama_kv_cache",
+        "^ggml_metal_",
         "^gguf_",
         "^system_info:",
         "^main: "
@@ -271,14 +272,94 @@ local function should_capture_line(line)
         end
     end
     
+    -- Also capture lines with load time or memory info
+    if line:match("load time") or line:match(" mem ") or line:match("memory") then
+        return true
+    end
+    
     return false
+end
+
+local function sanitize_large_arrays(line)
+    -- Replace massive tokenizer arrays with placeholders
+    -- Match pattern: "key arr[type,count] = [...]"
+    -- If count > 2048, replace entire value with clean placeholder
+    
+    local prefix, key, arr_type, count, rest = line:match("^(.-)([%w%.]+)%s+arr%[([^,]+),(%d+)%]%s*=%s*(.*)$")
+    
+    if prefix and count then
+        local num_count = tonumber(count)
+        if num_count and num_count > 2048 then
+            -- Fully omit large arrays with clean placeholder
+            return prefix .. key .. " arr[" .. arr_type .. "," .. count .. "] = <omitted, " .. count .. " entries>"
+        end
+    end
+    
+    return line
+end
+
+local function parse_kv_line(line)
+    -- Parse lines like: "llama_model_loader: - kv  32: llama.block_count u32 = 40"
+    -- Returns: key, value, type
+    
+    local key, type_str, value_str = line:match("llama_model_loader:%s*%- kv%s+%d+:%s+([%w%.]+)%s+(%S+)%s*=%s*(.+)$")
+    
+    if not key then
+        return nil
+    end
+    
+    -- Handle different types
+    if type_str == "u32" or type_str == "i32" or type_str == "u64" or type_str == "i64" then
+        local num = tonumber(value_str)
+        return key, num
+    elseif type_str == "f32" or type_str == "f64" then
+        local num = tonumber(value_str)
+        return key, num
+    elseif type_str == "bool" then
+        return key, (value_str == "true")
+    elseif type_str == "str" then
+        -- Remove quotes if present
+        local str = value_str:match('^"(.*)"$') or value_str
+        return key, str
+    elseif type_str:match("^arr%[") then
+        -- Handle arrays - check size and omit if large
+        local arr_type, count = type_str:match("arr%[([^,]+),(%d+)%]")
+        local num_count = tonumber(count)
+        
+        -- Omit arrays with >2048 entries
+        if num_count and num_count > 2048 then
+            return key, {
+                type = "array",
+                array_type = arr_type,
+                count = num_count,
+                note = "omitted"
+            }
+        elseif value_str:match("<omitted") then
+            -- Already omitted in the line
+            return key, {
+                type = "array",
+                array_type = arr_type,
+                count = num_count,
+                note = "omitted"
+            }
+        else
+            -- Small array - just note the type
+            return key, {
+                type = "array", 
+                array_type = arr_type,
+                count = num_count
+            }
+        end
+    end
+    
+    return nil
 end
 
 local function get_model_info_path(model_name)
     return MODEL_INFO_DIR .. "/" .. model_name .. ".json"
 end
 
-local function save_model_info(config, model_name, captured_lines, is_partial)
+local function save_model_info(config, model_name, captured_lines, run_config, end_reason, exit_code)
     ensure_model_info_dir()
     
     local model_path = expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
@@ -286,6 +367,48 @@ local function save_model_info(config, model_name, captured_lines, is_partial)
     
     if not fingerprint then
         return false
+    end
+    
+    -- Parse KV lines into structured dictionary
+    local kv = {}
+    for _, line in ipairs(captured_lines) do
+        local key, value = parse_kv_line(line)
+        if key then
+            kv[key] = value
+        end
+    end
+    
+    -- Build derived fields for tuning
+    local derived = {}
+    
+    -- Extract training context from KV
+    if kv["llama.context_length"] then
+        derived.ctx_train = kv["llama.context_length"]
+    end
+    
+    -- Extract runtime context from run args
+    if run_config and run_config.argv then
+        for i, arg in ipairs(run_config.argv) do
+            if (arg == "-c" or arg == "--ctx-size") and run_config.argv[i+1] then
+                derived.ctx_runtime = tonumber(run_config.argv[i+1])
+            elseif arg == "--cache-type-k" and run_config.argv[i+1] then
+                derived.cache_type_k = run_config.argv[i+1]
+            elseif arg == "--cache-type-v" and run_config.argv[i+1] then
+                derived.cache_type_v = run_config.argv[i+1]
+            end
+        end
+    end
+    
+    -- Extract KV cache memory from captured lines (best-effort)
+    for _, line in ipairs(captured_lines) do
+        local kv_mib = line:match("llama_kv_cache.*%s(%d+%.%d+)%s*MiB")
+        if not kv_mib then
+            kv_mib = line:match("llama_kv_cache.*%s(%d+)%s*MiB")
+        end
+        if kv_mib then
+            derived.kv_cache_mib = tonumber(kv_mib)
+            break
+        end
     end
     
     local info = {
@@ -296,7 +419,12 @@ local function save_model_info(config, model_name, captured_lines, is_partial)
         captured_at = os.time(),
         llama_cpp_path = expand_path(config.llama_cpp_path),
         captured_lines = captured_lines,
-        partial = is_partial or false
+        kv = kv,
+        derived = derived,
+        run_config = run_config,
+        is_partial = (end_reason ~= "exit" or exit_code ~= 0),
+        end_reason = end_reason,
+        exit_code = exit_code
     }
     
     local info_path = get_model_info_path(model_name)
@@ -489,12 +617,13 @@ local function build_llama_command(config, model_name, extra_args)
         end
     end
     
-    -- Quote all args safely for POSIX shells
+    -- Build quoted command string
+    local quoted_argv = {}
     for i = 1, #argv do
-        argv[i] = sh_quote(argv[i])
+        quoted_argv[i] = sh_quote(argv[i])
     end
     
-    return table.concat(argv, " ")
+    return table.concat(quoted_argv, " "), argv
 end
 
 local function run_model(config, model_name, extra_args)
@@ -509,10 +638,28 @@ local function run_model(config, model_name, extra_args)
         os.exit(1)
     end
     
-    local cmd = build_llama_command(config, model_name, extra_args)
+    local cmd, argv = build_llama_command(config, model_name, extra_args)
     print("Starting llama.cpp with: " .. model_name)
     print("Command: " .. cmd)
     print()
+    
+    -- Build run config for storage
+    local run_config = {
+        llama_cpp_path = expand_path(config.llama_cpp_path),
+        argv = argv,
+        models_dir = expand_path(config.models_dir),
+        model_name = model_name,
+        extra_args = extra_args or {}
+    }
+    
+    -- Extract host/port from argv if present
+    for i, arg in ipairs(argv) do
+        if arg == "--host" and argv[i+1] then
+            run_config.host = argv[i+1]
+        elseif arg == "--port" and argv[i+1] then
+            run_config.port = tonumber(argv[i+1])
+        end
+    end
     
     -- State that persists across the run
     local captured_lines = {}
@@ -523,6 +670,8 @@ local function run_model(config, model_name, extra_args)
     local capturing = true
     local pipe = nil
     local info_written = false
+    local end_reason = "exit"
+    local final_exit_code = 0
     
     -- Finalize function that ALWAYS runs
     local function finalize(opts)
@@ -533,21 +682,24 @@ local function run_model(config, model_name, extra_args)
             pcall(function() pipe:close() end)
         end
         
+        -- Determine end reason and exit code
+        end_reason = opts.interrupted and "sigint" or (opts.error and "error" or "exit")
+        final_exit_code = opts.exit_code or 0
+        
         -- Always save captured metadata if we have any
         if #captured_lines > 0 then
-            local is_partial = opts.interrupted or (opts.exit_code ~= 0)
-            save_model_info(config, model_name, captured_lines, is_partial)
+            save_model_info(config, model_name, captured_lines, run_config, end_reason, final_exit_code)
         end
         
         -- Always update history with final status
         local status = "exited"
         if opts.interrupted then
             status = "interrupted"
-        elseif opts.exit_code and opts.exit_code ~= 0 then
+        elseif final_exit_code ~= 0 then
             status = "failed"
         end
         
-        add_to_history(model_name, status, opts.exit_code)
+        add_to_history(model_name, status, final_exit_code)
     end
     
     -- Write initial "running" history entry
@@ -566,13 +718,15 @@ local function run_model(config, model_name, extra_args)
             
             -- Capture relevant lines
             if capturing and should_capture_line(line) then
-                table.insert(captured_lines, line)
+                -- Sanitize large arrays before storing
+                local sanitized_line = sanitize_large_arrays(line)
+                table.insert(captured_lines, sanitized_line)
                 capture_count = capture_count + 1
-                capture_bytes = capture_bytes + #line
+                capture_bytes = capture_bytes + #sanitized_line
                 
                 -- Write model info early (first time we get metadata)
                 if not info_written and #captured_lines >= 10 then
-                    save_model_info(config, model_name, captured_lines, true)
+                    save_model_info(config, model_name, captured_lines, run_config, "running", 0)
                     info_written = true
                 end
                 
@@ -608,7 +762,7 @@ local function run_model(config, model_name, extra_args)
             os.exit(130)
         else
             -- Other error: finalize and propagate
-            finalize({ exit_code = 1, interrupted = false, reason = "error" })
+            finalize({ exit_code = 1, interrupted = false, error = true })
             error(err)
         end
     end
@@ -775,14 +929,85 @@ local function main(args)
         
     elseif args[1] == "info" then
         -- Show cached model info
-        if #args < 2 then
-            print("Error: Missing model name")
-            print("Usage: luallm info <model_name>")
-            os.exit(1)
-        end
-        
         local model_name = args[2]
         local raw_mode = args[3] == "--raw"
+        local show_kv = args[3] == "--kv"
+        
+        -- If no model name, show picker of models with cached info
+        if not model_name then
+            ensure_model_info_dir()
+            local models_with_info = {}
+            
+            -- Scan model_info directory for cached info files
+            if is_dir(MODEL_INFO_DIR) then
+                for file in lfs.dir(MODEL_INFO_DIR) do
+                    if file:match("%.json$") then
+                        local name = file:gsub("%.json$", "")
+                        table.insert(models_with_info, name)
+                    end
+                end
+            end
+            
+            if #models_with_info == 0 then
+                print("No cached model info found.")
+                print("Run a model once to capture its metadata.")
+                os.exit(0)
+            end
+            
+            -- Sort alphabetically
+            table.sort(models_with_info)
+            
+            -- Show picker
+            print("Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):")
+            print()
+            local selected = with_raw_tty(function()
+                local idx = 1
+                local function draw()
+                    io.write("\27[2J\27[H")
+                    print("Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):\n")
+                    
+                    for i, name in ipairs(models_with_info) do
+                        if i == idx then
+                            io.write("  → \27[1m" .. name .. "\27[0m\n")
+                        else
+                            io.write("    " .. name .. "\n")
+                        end
+                    end
+                end
+                
+                draw()
+                
+                while true do
+                    local char = io.read(1)
+                    
+                    if char == "\27" then
+                        local next = io.read(1)
+                        if next == "[" then
+                            local arrow = io.read(1)
+                            if arrow == "A" then
+                                idx = idx > 1 and idx - 1 or #models_with_info
+                                draw()
+                            elseif arrow == "B" then
+                                idx = idx < #models_with_info and idx + 1 or 1
+                                draw()
+                            end
+                        end
+                    elseif char == "\n" or char == "\r" then
+                        return models_with_info[idx]
+                    elseif char == "q" or char == "Q" then
+                        return nil
+                    end
+                end
+            end)
+            
+            if not selected then
+                os.exit(0)
+            end
+            
+            model_name = selected
+            -- Clear screen after picker
+            io.write("\27[2J\27[H")
+        end
         
         local info, status = load_model_info(model_name)
         
@@ -803,12 +1028,42 @@ local function main(args)
             print()
         end
         
-        if info.partial then
-            print("⚠ Note: This is partial metadata (capture was interrupted)")
+        if info.is_partial then
+            local reason_str = info.end_reason == "sigint" and "interrupted by user" or
+                             info.end_reason == "error" and "error during run" or
+                             "non-zero exit"
+            print("⚠ Note: Partial capture (" .. reason_str .. ", exit code: " .. (info.exit_code or "unknown") .. ")")
             print()
         end
         
-        if raw_mode then
+        if show_kv then
+            -- Show structured KV data
+            print("Structured Model Metadata (KV):")
+            print()
+            if info.kv and next(info.kv) then
+                -- Sort keys for consistent display
+                local keys = {}
+                for k in pairs(info.kv) do
+                    table.insert(keys, k)
+                end
+                table.sort(keys)
+                
+                for _, key in ipairs(keys) do
+                    local value = info.kv[key]
+                    if type(value) == "table" then
+                        if value.type == "array" then
+                            print("  " .. key .. ": [array:" .. (value.array_type or "unknown") .. ", count:" .. (value.count or 0) .. "]")
+                        else
+                            print("  " .. key .. ": " .. json.encode(value))
+                        end
+                    else
+                        print("  " .. key .. ": " .. tostring(value))
+                    end
+                end
+            else
+                print("  (no structured KV data)")
+            end
+        elseif raw_mode then
             -- Print raw captured lines
             for _, line in ipairs(info.captured_lines) do
                 print(line)
@@ -822,12 +1077,83 @@ local function main(args)
             print("GGUF Modified: " .. os.date("%Y-%m-%d %H:%M:%S", info.gguf_mtime))
             print("Info Captured: " .. os.date("%Y-%m-%d %H:%M:%S", info.captured_at))
             print("llama.cpp: " .. info.llama_cpp_path)
+            if info.exit_code then
+                print("Exit Code: " .. info.exit_code)
+            end
+            if info.end_reason then
+                print("End Reason: " .. info.end_reason)
+            end
             print()
+            
+            -- Show run config if available
+            if info.run_config then
+                print("Run Configuration:")
+                if info.run_config.host then
+                    print("  Host: " .. info.run_config.host)
+                end
+                if info.run_config.port then
+                    print("  Port: " .. info.run_config.port)
+                end
+                if info.run_config.argv then
+                    print("  Command: " .. table.concat(info.run_config.argv, " "))
+                end
+                print()
+            end
+            
+            -- Show key metadata from KV if available
+            if info.kv and next(info.kv) then
+                print("Key Metadata:")
+                local important_keys = {
+                    "llama.context_length",
+                    "llama.embedding_length", 
+                    "llama.block_count",
+                    "llama.rope.freq_base",
+                    "general.quantization_version",
+                    "general.file_type",
+                    "tokenizer.ggml.model"
+                }
+                for _, key in ipairs(important_keys) do
+                    if info.kv[key] then
+                        local value = info.kv[key]
+                        if type(value) == "table" then
+                            print("  " .. key .. ": [complex]")
+                        else
+                            print("  " .. key .. ": " .. tostring(value))
+                        end
+                    end
+                end
+                print()
+            end
+            
+            -- Show derived tuning fields if available
+            if info.derived and next(info.derived) then
+                print("Derived (for tuning):")
+                if info.derived.ctx_train then
+                    print("  Training context: " .. info.derived.ctx_train)
+                end
+                if info.derived.ctx_runtime then
+                    print("  Runtime context: " .. info.derived.ctx_runtime)
+                end
+                if info.derived.cache_type_k then
+                    print("  Cache type K: " .. info.derived.cache_type_k)
+                end
+                if info.derived.cache_type_v then
+                    print("  Cache type V: " .. info.derived.cache_type_v)
+                end
+                if info.derived.kv_cache_mib then
+                    print("  KV cache memory: " .. info.derived.kv_cache_mib .. " MiB")
+                end
+                print()
+            end
+            
             print("Captured Metadata (" .. #info.captured_lines .. " lines):")
             print("---")
             for _, line in ipairs(info.captured_lines) do
                 print(line)
             end
+            print()
+            print("Use 'luallm info " .. model_name .. " --kv' to see all structured metadata")
+            print("Use 'luallm info " .. model_name .. " --raw' to see raw captured output")
         end
         
     elseif args[1] == "config" then
@@ -924,7 +1250,7 @@ local function main(args)
         print("  luallm list           List all available models (sorted by date)")
         print("  luallm <model>        Run a specific model")
         print("  luallm <model> ...    Run model with custom llama.cpp flags")
-        print("  luallm info <model>   Show cached model metadata")
+        print("  luallm info [model]   Show cached model metadata (interactive if no model)")
         print("  luallm config         Show config file location")
         print("  luallm rebuild        Rebuild llama.cpp from source")
         print("  luallm clear-history  Clear run history")
@@ -935,7 +1261,9 @@ local function main(args)
         print("  luallm                           # Pick from recent models")
         print("  luallm list                      # See all models")
         print("  luallm llama-3-8b                # Run specific model")
+        print("  luallm info                      # Pick model to view info")
         print("  luallm info llama-3-8b           # Show cached metadata")
+        print("  luallm info llama-3-8b --kv      # Show structured KV data")
         print("  luallm info llama-3-8b --raw     # Show raw captured output")
         print("  luallm codellama --port 9090     # Override default port")
         print("  luallm mistral -c 8192           # Override context size")
