@@ -300,13 +300,22 @@ end
 
 local function parse_kv_line(line)
     -- Parse lines like: "llama_model_loader: - kv  32: llama.block_count u32 = 40"
-    -- Returns: key, value, type
+    -- Returns: key, value
     
-    local key, type_str, value_str = line:match("llama_model_loader:%s*%- kv%s+%d+:%s+([%w%.]+)%s+(%S+)%s*=%s*(.+)$")
+    -- More robust pattern - allow underscores, dashes in keys
+    local key, type_str, value_str = line:match("^llama_model_loader:%s*%-?%s*kv%s+%d+:%s*([%w%._%-]+)%s+([%w%[%],]+)%s*=%s*(.+)$")
+    
+    -- Try without index number as fallback
+    if not key then
+        key, type_str, value_str = line:match("^llama_model_loader:%s*%-?%s*kv%s*:%s*([%w%._%-]+)%s+([%w%[%],]+)%s*=%s*(.+)$")
+    end
     
     if not key then
         return nil
     end
+    
+    -- Trim whitespace from value_str
+    value_str = value_str:match("^%s*(.-)%s*$")
     
     -- Handle different types
     if type_str == "u32" or type_str == "i32" or type_str == "u64" or type_str == "i64" then
@@ -322,37 +331,73 @@ local function parse_kv_line(line)
         local str = value_str:match('^"(.*)"$') or value_str
         return key, str
     elseif type_str:match("^arr%[") then
-        -- Handle arrays - check size and omit if large
+        -- Handle arrays
         local arr_type, count = type_str:match("arr%[([^,]+),(%d+)%]")
-        local num_count = tonumber(count)
+        local num_count = tonumber(count) or 0
         
-        -- Omit arrays with >2048 entries
-        if num_count and num_count > 2048 then
+        -- Check if value is the omitted placeholder
+        if value_str:match("^<omitted") then
             return key, {
                 type = "array",
                 array_type = arr_type,
                 count = num_count,
                 note = "omitted"
-            }
-        elseif value_str:match("<omitted") then
-            -- Already omitted in the line
-            return key, {
-                type = "array",
-                array_type = arr_type,
-                count = num_count,
-                note = "omitted"
-            }
-        else
-            -- Small array - just note the type
-            return key, {
-                type = "array", 
-                array_type = arr_type,
-                count = num_count
             }
         end
+        
+        -- Check for truncation with "..."
+        if value_str:find("%.%.%.") then
+            return key, {
+                type = "array",
+                array_type = arr_type,
+                count = num_count,
+                note = "truncated_in_output",
+                partial = true
+            }
+        end
+        
+        -- For large arrays (>2048), should already be omitted by sanitize_large_arrays
+        if num_count > 2048 then
+            return key, {
+                type = "array",
+                array_type = arr_type,
+                count = num_count,
+                note = "omitted"
+            }
+        end
+        
+        -- For small arrays, try to parse the actual values
+        if arr_type == "str" and value_str:match("^%[") then
+            -- String array - parse into Lua array
+            local items = {}
+            for item in value_str:gmatch('"([^"]*)"') do
+                table.insert(items, item)
+            end
+            if #items > 0 then
+                return key, items
+            end
+        elseif (arr_type == "i32" or arr_type == "u32" or arr_type == "f32") and value_str:match("^%[") then
+            -- Numeric array - parse into Lua array
+            local items = {}
+            for item in value_str:gmatch("%-?%d+%.?%d*") do
+                table.insert(items, tonumber(item))
+            end
+            if #items > 0 then
+                return key, items
+            end
+        end
+        
+        -- Fallback: store as string with type info
+        return key, {
+            type = "array",
+            array_type = arr_type,
+            count = num_count,
+            value = value_str
+        }
     end
     
-    return nil
+    -- Unknown type - store as string
+    return key, value_str
 end
 
 local function get_model_info_path(model_name)
@@ -378,6 +423,18 @@ local function save_model_info(config, model_name, captured_lines, run_config, e
         end
     end
     
+    -- Self-check: verify critical keys were parsed
+    local saw_ctx_line = false
+    for _, line in ipairs(captured_lines) do
+        if line:find("llama%.context_length") then
+            saw_ctx_line = true
+            break
+        end
+    end
+    if saw_ctx_line and kv["llama.context_length"] == nil then
+        kv["_kv_parse_warning"] = "missing llama.context_length despite being in captured_lines"
+    end
+    
     -- Build derived fields for tuning
     local derived = {}
     
@@ -399,6 +456,12 @@ local function save_model_info(config, model_name, captured_lines, run_config, e
         end
     end
     
+    -- Compute context ratio if both are available and numeric
+    if derived.ctx_train and derived.ctx_runtime and 
+       type(derived.ctx_train) == "number" and type(derived.ctx_runtime) == "number" then
+        derived.ctx_ratio = derived.ctx_runtime / derived.ctx_train
+    end
+    
     -- Extract KV cache memory from captured lines (best-effort)
     for _, line in ipairs(captured_lines) do
         local kv_mib = line:match("llama_kv_cache.*%s(%d+%.%d+)%s*MiB")
@@ -411,7 +474,11 @@ local function save_model_info(config, model_name, captured_lines, run_config, e
         end
     end
     
+    -- Ensure exit_code is an integer
+    local final_exit_code = exit_code and tonumber(exit_code) or 0
+    
     local info = {
+        schema_version = 1,
         model_name = model_name,
         gguf_path = model_path,
         gguf_size_bytes = fingerprint.size,
@@ -422,9 +489,9 @@ local function save_model_info(config, model_name, captured_lines, run_config, e
         kv = kv,
         derived = derived,
         run_config = run_config,
-        is_partial = (end_reason ~= "exit" or exit_code ~= 0),
+        is_partial = (end_reason ~= "exit" or final_exit_code ~= 0),
         end_reason = end_reason,
-        exit_code = exit_code
+        exit_code = final_exit_code
     }
     
     local info_path = get_model_info_path(model_name)
@@ -521,7 +588,90 @@ local function format_time(timestamp)
     return os.date("%b %d, %Y", timestamp)
 end
 
-local function print_model_list(models, models_dir)
+local function format_size(bytes)
+    if bytes < 1024 then
+        return bytes .. "B"
+    elseif bytes < 1024 * 1024 then
+        return string.format("%.1fKB", bytes / 1024)
+    elseif bytes < 1024 * 1024 * 1024 then
+        return string.format("%.1fMB", bytes / (1024 * 1024))
+    else
+        return string.format("%.1fGB", bytes / (1024 * 1024 * 1024))
+    end
+end
+
+local function extract_quant(model_name)
+    -- Extract quantization from model name
+    local quant = model_name:match("Q%d+_K_[MS]") or 
+                  model_name:match("Q%d+_K") or
+                  model_name:match("Q%d+_%d+") or
+                  model_name:match("Q%d+")
+    return quant or "?"
+end
+
+local function get_model_row(config, model_name)
+    -- Returns: name, size_str, quant, last_run_str
+    local model_path = expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
+    
+    -- Get size
+    local size_str = "?"
+    local attr = path_attr(model_path)
+    if attr then
+        size_str = format_size(attr.size)
+    end
+    
+    -- Get quant
+    local quant = extract_quant(model_name)
+    
+    -- Get last run time (check history first, then model_info)
+    local last_run_str = "never"
+    local history = load_history()
+    for _, entry in ipairs(history) do
+        local name = type(entry) == "string" and entry or entry.name
+        if name == model_name then
+            local timestamp = type(entry) == "table" and entry.last_run or nil
+            if timestamp then
+                last_run_str = format_time(timestamp)
+            end
+            break
+        end
+    end
+    
+    -- Fallback to model_info captured_at if not in history
+    if last_run_str == "never" then
+        local info = load_model_info(model_name)
+        if info and info.captured_at then
+            last_run_str = format_time(info.captured_at)
+        end
+    end
+    
+    return model_name, size_str, quant, last_run_str
+end
+
+local function calculate_column_widths(model_data)
+    -- Calculate max widths for alignment
+    local max_name, max_size, max_quant = 0, 0, 0
+    for _, m in ipairs(model_data) do
+        if #m.name > max_name then max_name = #m.name end
+        if #m.size_str > max_size then max_size = #m.size_str end
+        if #m.quant > max_quant then max_quant = #m.quant end
+    end
+    return max_name, max_size, max_quant
+end
+
+local function format_model_row(model_data_item, max_name, max_size, max_quant)
+    -- Returns formatted row string with proper column alignment
+    local name_pad = string.rep(" ", max_name - #model_data_item.name)
+    local size_pad = string.rep(" ", max_size - #model_data_item.size_str)
+    local quant_pad = string.rep(" ", max_quant - #model_data_item.quant)
+    
+    return model_data_item.name .. name_pad .. "  " .. 
+           model_data_item.size_str .. size_pad .. "  " .. 
+           model_data_item.quant .. quant_pad .. "  " .. 
+           model_data_item.last_run_str
+end
+
+local function print_model_list(models, models_dir, config)
     if #models == 0 then
         print("  No models found.")
         return
@@ -530,48 +680,49 @@ local function print_model_list(models, models_dir)
     -- Load history to check for last run times
     local history = load_history()
     
-    -- Convert simple names to model objects if needed
+    -- Convert simple names to model objects if needed and add row data
     local model_list = {}
     for _, model in ipairs(models) do
-        if type(model) == "string" then
-            -- Simple name - need to get the file info
-            local filepath = expand_path(models_dir) .. "/" .. model .. ".gguf"
-            local attr = lfs.attributes(filepath)
-            local mtime = attr and attr.modification or 0
-            
-            -- Check if we have a last run time in history
-            local last_run = get_last_run_time(model, history)
-            if last_run then
-                mtime = last_run
+        local name = type(model) == "string" and model or model.name
+        local _, size_str, quant, last_run_str = get_model_row(config, name)
+        
+        table.insert(model_list, {
+            name = name,
+            size_str = size_str,
+            quant = quant,
+            last_run_str = last_run_str,
+            -- Get timestamp for sorting
+            last_run_ts = 0
+        })
+        
+        -- Get timestamp for sorting
+        for _, entry in ipairs(history) do
+            local h_name = type(entry) == "string" and entry or entry.name
+            if h_name == name then
+                model_list[#model_list].last_run_ts = type(entry) == "table" and entry.last_run or 0
+                break
             end
-            
-            table.insert(model_list, {name = model, mtime = mtime})
-        else
-            -- Already a model object, check for last run time
-            local last_run = get_last_run_time(model.name, history)
-            if last_run then
-                model.mtime = last_run
+        end
+        
+        if model_list[#model_list].last_run_ts == 0 then
+            local info = load_model_info(name)
+            if info and info.captured_at then
+                model_list[#model_list].last_run_ts = info.captured_at
             end
-            table.insert(model_list, model)
         end
     end
     
-    -- Sort by modification time, newest first
+    -- Sort by last run time, newest first
     table.sort(model_list, function(a, b)
-        return a.mtime > b.mtime
+        return a.last_run_ts > b.last_run_ts
     end)
     
-    -- Find longest model name for alignment
-    local max_len = 0
-    for _, model in ipairs(model_list) do
-        if #model.name > max_len then
-            max_len = #model.name
-        end
-    end
+    -- Calculate column widths
+    local max_name, max_size, max_quant = calculate_column_widths(model_list)
     
-    for _, model in ipairs(model_list) do
-        local padding = string.rep(" ", max_len - #model.name)
-        print("  " .. model.name .. padding .. "  " .. format_time(model.mtime))
+    -- Print each row
+    for _, m in ipairs(model_list) do
+        print("  " .. format_model_row(m, max_name, max_size, max_quant))
     end
 end
 
@@ -649,7 +800,7 @@ local function run_model(config, model_name, extra_args)
         argv = argv,
         models_dir = expand_path(config.models_dir),
         model_name = model_name,
-        extra_args = extra_args or {}
+        extra_args = (extra_args and #extra_args > 0) and extra_args or json.empty_array
     }
     
     -- Extract host/port from argv if present
@@ -848,31 +999,43 @@ local function with_raw_tty(fn)
     return result
 end
 
-local function show_picker(models)
+local function show_picker(models, config, title)
     if #models == 0 then
-        print("No recent models found.")
+        print("No models found.")
         return nil
     end
     
-    -- Convert history entries to just names for display
-    local model_names = {}
+    title = title or "Select a model (↑/↓ arrows, Enter to confirm, q to quit):"
+    
+    -- Convert history entries to model data with formatting
+    local model_data = {}
     for _, entry in ipairs(models) do
         local name = type(entry) == "string" and entry or entry.name
-        table.insert(model_names, name)
+        local _, size_str, quant, last_run_str = get_model_row(config, name)
+        table.insert(model_data, {
+            name = name,
+            size_str = size_str,
+            quant = quant,
+            last_run_str = last_run_str
+        })
     end
+    
+    -- Calculate column widths for alignment
+    local max_name, max_size, max_quant = calculate_column_widths(model_data)
     
     return with_raw_tty(function()
         local selected = 1
         local function draw()
             -- Clear screen and move cursor to top
             io.write("\27[2J\27[H")
-            print("Select a model (↑/↓ arrows, Enter to confirm, q to quit):\n")
+            print(title .. "\n")
             
-            for i, model in ipairs(model_names) do
+            for i, m in ipairs(model_data) do
+                local row = format_model_row(m, max_name, max_size, max_quant)
                 if i == selected then
-                    io.write("  → \27[1m" .. model .. "\27[0m\n")
+                    io.write("  → \27[1m" .. row .. "\27[0m\n")
                 else
-                    io.write("    " .. model .. "\n")
+                    io.write("    " .. row .. "\n")
                 end
             end
         end
@@ -888,20 +1051,48 @@ local function show_picker(models)
                 if next == "[" then
                     local arrow = io.read(1)
                     if arrow == "A" then -- Up
-                        selected = selected > 1 and selected - 1 or #model_names
+                        selected = selected > 1 and selected - 1 or #model_data
                         draw()
                     elseif arrow == "B" then -- Down
-                        selected = selected < #model_names and selected + 1 or 1
+                        selected = selected < #model_data and selected + 1 or 1
                         draw()
                     end
                 end
             elseif char == "\n" or char == "\r" then
-                return model_names[selected]
+                return model_data[selected].name
             elseif char == "q" or char == "Q" then
                 return nil
             end
         end
     end)
+end
+
+-- Fuzzy model matching
+local function find_matching_models(config, query)
+    local all_models = list_models(config.models_dir)
+    local query_lower = query:lower()
+    
+    -- Check for exact match first (case-insensitive)
+    for _, model in ipairs(all_models) do
+        if model.name:lower() == query_lower then
+            return {model.name}, "exact"
+        end
+    end
+    
+    -- Substring match (case-insensitive)
+    local matches = {}
+    for _, model in ipairs(all_models) do
+        if model.name:lower():find(query_lower, 1, true) then
+            table.insert(matches, model.name)
+        end
+    end
+    
+    if #matches > 0 then
+        return matches, "substring"
+    end
+    
+    -- No matches
+    return {}, "none"
 end
 
 -- Main logic
@@ -916,7 +1107,7 @@ local function main(args)
             os.exit(0)
         end
         
-        local selected = show_picker(recent)
+        local selected = show_picker(recent, config)
         if selected then
             run_model(config, selected, nil)
         end
@@ -925,7 +1116,7 @@ local function main(args)
         -- List all models
         local models = list_models(config.models_dir)
         print("Available models in " .. expand_path(config.models_dir) .. ":\n")
-        print_model_list(models, config.models_dir)
+        print_model_list(models, config.models_dir, config)
         
     elseif args[1] == "info" then
         -- Show cached model info
@@ -954,51 +1145,14 @@ local function main(args)
                 os.exit(0)
             end
             
-            -- Sort alphabetically
-            table.sort(models_with_info)
+            -- Convert to model objects for picker
+            local info_models = {}
+            for _, name in ipairs(models_with_info) do
+                table.insert(info_models, {name = name})
+            end
             
             -- Show picker
-            print("Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):")
-            print()
-            local selected = with_raw_tty(function()
-                local idx = 1
-                local function draw()
-                    io.write("\27[2J\27[H")
-                    print("Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):\n")
-                    
-                    for i, name in ipairs(models_with_info) do
-                        if i == idx then
-                            io.write("  → \27[1m" .. name .. "\27[0m\n")
-                        else
-                            io.write("    " .. name .. "\n")
-                        end
-                    end
-                end
-                
-                draw()
-                
-                while true do
-                    local char = io.read(1)
-                    
-                    if char == "\27" then
-                        local next = io.read(1)
-                        if next == "[" then
-                            local arrow = io.read(1)
-                            if arrow == "A" then
-                                idx = idx > 1 and idx - 1 or #models_with_info
-                                draw()
-                            elseif arrow == "B" then
-                                idx = idx < #models_with_info and idx + 1 or 1
-                                draw()
-                            end
-                        end
-                    elseif char == "\n" or char == "\r" then
-                        return models_with_info[idx]
-                    elseif char == "q" or char == "Q" then
-                        return nil
-                    end
-                end
-            end)
+            local selected = show_picker(info_models, config, "Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):")
             
             if not selected then
                 os.exit(0)
@@ -1033,6 +1187,12 @@ local function main(args)
                              info.end_reason == "error" and "error during run" or
                              "non-zero exit"
             print("⚠ Note: Partial capture (" .. reason_str .. ", exit code: " .. (info.exit_code or "unknown") .. ")")
+            print()
+        end
+        
+        -- Show KV parse warning if present
+        if info.kv and info.kv["_kv_parse_warning"] then
+            print("⚠ KV Parse Warning: " .. info.kv["_kv_parse_warning"])
             print()
         end
         
@@ -1133,6 +1293,9 @@ local function main(args)
                 end
                 if info.derived.ctx_runtime then
                     print("  Runtime context: " .. info.derived.ctx_runtime)
+                end
+                if info.derived.ctx_ratio then
+                    print("  Context ratio: " .. string.format("%.2f", info.derived.ctx_ratio))
                 end
                 if info.derived.cache_type_k then
                     print("  Cache type K: " .. info.derived.cache_type_k)
@@ -1274,14 +1437,56 @@ local function main(args)
         print()
         
     else
-        -- Run specific model
-        local model_name = args[1]
+        -- Run specific model with fuzzy matching
+        local model_query = args[1]
         local extra_args = {}
         for i = 2, #args do
             table.insert(extra_args, args[i])
         end
         
-        run_model(config, model_name, extra_args)
+        -- Find matching models
+        local matches, match_type = find_matching_models(config, model_query)
+        
+        if #matches == 0 then
+            -- No matches
+            print("No model found matching: " .. model_query)
+            print()
+            print("Available models:")
+            local all_models = list_models(config.models_dir)
+            
+            -- Build model data for up to 5 most recent
+            local suggestions = {}
+            for i = 1, math.min(5, #all_models) do
+                local _, size_str, quant, last_run_str = get_model_row(config, all_models[i].name)
+                table.insert(suggestions, {
+                    name = all_models[i].name,
+                    size_str = size_str,
+                    quant = quant,
+                    last_run_str = last_run_str
+                })
+            end
+            
+            -- Calculate column widths and print
+            local max_name, max_size, max_quant = calculate_column_widths(suggestions)
+            for _, m in ipairs(suggestions) do
+                print("  " .. format_model_row(m, max_name, max_size, max_quant))
+            end
+            os.exit(1)
+        elseif #matches == 1 then
+            -- Exact match, run it
+            run_model(config, matches[1], extra_args)
+        else
+            -- Multiple matches, show picker
+            print("Multiple models match '" .. model_query .. "':\n")
+            local match_models = {}
+            for _, name in ipairs(matches) do
+                table.insert(match_models, {name = name})
+            end
+            local selected = show_picker(match_models, config, "Select a model (↑/↓ arrows, Enter to confirm, q to quit):")
+            if selected then
+                run_model(config, selected, extra_args)
+            end
+        end
     end
 end
 
