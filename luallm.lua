@@ -30,6 +30,7 @@ local lfs = require("lfs")
 local CONFIG_DIR = (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config")) .. "/luaLLM"
 local CONFIG_FILE = CONFIG_DIR .. "/config.json"
 local HISTORY_FILE = CONFIG_DIR .. "/history.json"
+local PINS_FILE = CONFIG_DIR .. "/pins.json"
 local MODEL_INFO_DIR = CONFIG_DIR .. "/model_info"
 
 -- Utility functions
@@ -216,13 +217,28 @@ local function add_to_history(model_name, status, exit_code)
     save_history(history)
 end
 
-local function get_recent_models(config)
+local function get_recent_models(config, exclude_set, limit)
+    -- Returns up to 'limit' recent models, excluding any in exclude_set
+    -- exclude_set is a table where keys are model names to exclude
     local history = load_history()
-    local count = config.recent_models_count or 4
-    local recent = {}
+    exclude_set = exclude_set or {}
+    limit = limit or (config.recent_models_count or 4)
     
-    for i = 1, math.min(count, #history) do
-        table.insert(recent, history[i])
+    local recent = {}
+    local seen = {}
+    
+    for _, entry in ipairs(history) do
+        local name = type(entry) == "string" and entry or entry.name
+        
+        -- Skip if excluded or already seen
+        if not exclude_set[name] and not seen[name] then
+            table.insert(recent, entry)
+            seen[name] = true
+            
+            if #recent >= limit then
+                break
+            end
+        end
     end
     
     return recent
@@ -230,6 +246,65 @@ end
 
 local function clear_history()
     save_history({})
+end
+
+-- Pins management
+local function load_pins()
+    if not file_exists(PINS_FILE) then
+        return {}
+    end
+    
+    local pins, err = load_json(PINS_FILE)
+    if err or type(pins) ~= "table" then
+        io.stderr:write("Warning: Invalid pins file, treating as empty\n")
+        return {}
+    end
+    
+    return pins
+end
+
+local function save_pins(pins)
+    save_json(PINS_FILE, pins)
+end
+
+local function is_pinned(model_name)
+    local pins = load_pins()
+    for _, pin in ipairs(pins) do
+        if pin == model_name then
+            return true
+        end
+    end
+    return false
+end
+
+local function add_pin(model_name)
+    local pins = load_pins()
+    
+    -- Check if already pinned
+    for _, pin in ipairs(pins) do
+        if pin == model_name then
+            return false -- Already pinned
+        end
+    end
+    
+    -- Add to end
+    table.insert(pins, model_name)
+    save_pins(pins)
+    return true
+end
+
+local function remove_pin(model_name)
+    local pins = load_pins()
+    
+    for i, pin in ipairs(pins) do
+        if pin == model_name then
+            table.remove(pins, i)
+            save_pins(pins)
+            return true
+        end
+    end
+    
+    return false -- Not pinned
 end
 
 local function get_last_run_time(model_name, history)
@@ -1033,7 +1108,7 @@ local function show_picker(models, config, title)
             for i, m in ipairs(model_data) do
                 local row = format_model_row(m, max_name, max_size, max_quant)
                 if i == selected then
-                    io.write("  → \27[1m" .. row .. "\27[0m\n")
+                    io.write("  > \27[1m" .. row .. "\27[0m\n")
                 else
                     io.write("    " .. row .. "\n")
                 end
@@ -1060,6 +1135,134 @@ local function show_picker(models, config, title)
                 end
             elseif char == "\n" or char == "\r" then
                 return model_data[selected].name
+            elseif char == "q" or char == "Q" then
+                return nil
+            end
+        end
+    end)
+end
+
+local function show_sectioned_picker(config)
+    -- Build combined pinned + recent picker with sections
+    local pins = load_pins()
+    local recent_limit = config.recent_models_count or 7
+    
+    -- Build pinned set for exclusion
+    local pinned_set = {}
+    for _, name in ipairs(pins) do
+        pinned_set[name] = true
+    end
+    
+    -- Build pinned section data
+    local pinned_data = {}
+    for _, name in ipairs(pins) do
+        local model_path = expand_path(config.models_dir) .. "/" .. name .. ".gguf"
+        if file_exists(model_path) then
+            local _, size_str, quant, last_run_str = get_model_row(config, name)
+            table.insert(pinned_data, {
+                name = name,
+                size_str = size_str,
+                quant = quant,
+                last_run_str = last_run_str
+            })
+        end
+    end
+    
+    -- Get recent models excluding pinned
+    local recent_models = get_recent_models(config, pinned_set, recent_limit)
+    local recent_data = {}
+    for _, entry in ipairs(recent_models) do
+        local name = type(entry) == "string" and entry or entry.name
+        local _, size_str, quant, last_run_str = get_model_row(config, name)
+        table.insert(recent_data, {
+            name = name,
+            size_str = size_str,
+            quant = quant,
+            last_run_str = last_run_str
+        })
+    end
+    
+    -- Build render items array
+    local render_items = {}
+    local selectable_indices = {}
+    
+    if #pinned_data > 0 then
+        table.insert(render_items, {kind = "header", text = "Pinned"})
+        for _, m in ipairs(pinned_data) do
+            table.insert(render_items, {kind = "model", model_data = m})
+            table.insert(selectable_indices, #render_items)
+        end
+    end
+    
+    table.insert(render_items, {kind = "header", text = "Recent"})
+    if #recent_data > 0 then
+        for _, m in ipairs(recent_data) do
+            table.insert(render_items, {kind = "model", model_data = m})
+            table.insert(selectable_indices, #render_items)
+        end
+    else
+        table.insert(render_items, {kind = "message", text = "(none)"})
+    end
+    
+    if #selectable_indices == 0 then
+        print("No models available.")
+        return nil
+    end
+    
+    -- Calculate column widths across all model data
+    local all_model_data = {}
+    for _, item in ipairs(render_items) do
+        if item.kind == "model" then
+            table.insert(all_model_data, item.model_data)
+        end
+    end
+    local max_name, max_size, max_quant = calculate_column_widths(all_model_data)
+    
+    return with_raw_tty(function()
+        local selected_idx = 1 -- Index into selectable_indices
+        
+        local function draw()
+            io.write("\27[2J\27[H")
+            print("Select a model (↑/↓ arrows, Enter to confirm, q to quit):\n")
+            
+            local current_selectable = selectable_indices[selected_idx]
+            
+            for i, item in ipairs(render_items) do
+                if item.kind == "header" then
+                    io.write("\27[1m" .. item.text .. "\27[0m\n")
+                elseif item.kind == "model" then
+                    local row = format_model_row(item.model_data, max_name, max_size, max_quant)
+                    if i == current_selectable then
+                        io.write("  > \27[1m" .. row .. "\27[0m\n")
+                    else
+                        io.write("    " .. row .. "\n")
+                    end
+                elseif item.kind == "message" then
+                    io.write("  " .. item.text .. "\n")
+                end
+            end
+        end
+        
+        draw()
+        
+        while true do
+            local char = io.read(1)
+            
+            if char == "\27" then
+                local next = io.read(1)
+                if next == "[" then
+                    local arrow = io.read(1)
+                    if arrow == "A" then -- Up
+                        selected_idx = selected_idx > 1 and selected_idx - 1 or #selectable_indices
+                        draw()
+                    elseif arrow == "B" then -- Down
+                        selected_idx = selected_idx < #selectable_indices and selected_idx + 1 or 1
+                        draw()
+                    end
+                end
+            elseif char == "\n" or char == "\r" then
+                local render_idx = selectable_indices[selected_idx]
+                return render_items[render_idx].model_data.name
             elseif char == "q" or char == "Q" then
                 return nil
             end
@@ -1100,14 +1303,8 @@ local function main(args)
     local config = load_config()
     
     if #args == 0 then
-        -- Show interactive picker with recent models
-        local recent = get_recent_models(config)
-        if #recent == 0 then
-            print("No recent models. Use 'luallm list' to see available models.")
-            os.exit(0)
-        end
-        
-        local selected = show_picker(recent, config)
+        -- Show interactive picker with pinned + recent models
+        local selected = show_sectioned_picker(config)
         if selected then
             run_model(config, selected, nil)
         end
@@ -1333,6 +1530,126 @@ local function main(args)
         clear_history()
         print("✓ History cleared")
         
+    elseif args[1] == "pin" then
+        -- Pin a model
+        if #args < 2 then
+            print("Error: Missing model name")
+            print("Usage: luallm pin <model_name>")
+            os.exit(1)
+        end
+        
+        local model_query = args[2]
+        local matches, match_type = find_matching_models(config, model_query)
+        
+        if #matches == 0 then
+            print("No model found matching: " .. model_query)
+            print()
+            print("Available models:")
+            local all_models = list_models(config.models_dir)
+            local suggestions = {}
+            for i = 1, math.min(10, #all_models) do
+                local _, size_str, quant, last_run_str = get_model_row(config, all_models[i].name)
+                table.insert(suggestions, {
+                    name = all_models[i].name,
+                    size_str = size_str,
+                    quant = quant,
+                    last_run_str = last_run_str
+                })
+            end
+            local max_name, max_size, max_quant = calculate_column_widths(suggestions)
+            for _, m in ipairs(suggestions) do
+                print("  " .. format_model_row(m, max_name, max_size, max_quant))
+            end
+            os.exit(1)
+        elseif #matches == 1 then
+            local model_name = matches[1]
+            if add_pin(model_name) then
+                print("Pinned: " .. model_name)
+            else
+                print("Already pinned: " .. model_name)
+            end
+        else
+            print("Multiple models match '" .. model_query .. "':\n")
+            local match_models = {}
+            for _, name in ipairs(matches) do
+                table.insert(match_models, {name = name})
+            end
+            local selected = show_picker(match_models, config, "Select a model to pin (↑/↓ arrows, Enter to confirm, q to quit):")
+            if selected then
+                if add_pin(selected) then
+                    print("Pinned: " .. selected)
+                else
+                    print("Already pinned: " .. selected)
+                end
+            end
+        end
+        
+    elseif args[1] == "unpin" then
+        -- Unpin a model
+        if #args < 2 then
+            print("Error: Missing model name")
+            print("Usage: luallm unpin <model_name>")
+            os.exit(1)
+        end
+        
+        local model_query = args[2]
+        local matches, match_type = find_matching_models(config, model_query)
+        
+        if #matches == 0 then
+            print("No model found matching: " .. model_query)
+            os.exit(1)
+        elseif #matches == 1 then
+            local model_name = matches[1]
+            if remove_pin(model_name) then
+                print("Unpinned: " .. model_name)
+            else
+                print("Not pinned: " .. model_name)
+            end
+        else
+            print("Multiple models match '" .. model_query .. "':\n")
+            local match_models = {}
+            for _, name in ipairs(matches) do
+                table.insert(match_models, {name = name})
+            end
+            local selected = show_picker(match_models, config, "Select a model to unpin (↑/↓ arrows, Enter to confirm, q to quit):")
+            if selected then
+                if remove_pin(selected) then
+                    print("Unpinned: " .. selected)
+                else
+                    print("Not pinned: " .. selected)
+                end
+            end
+        end
+        
+    elseif args[1] == "pinned" then
+        -- List pinned models
+        local pins = load_pins()
+        
+        if #pins == 0 then
+            print("No pinned models.")
+            os.exit(0)
+        end
+        
+        print("Pinned models:\n")
+        
+        -- Build model data for all pins
+        local pin_data = {}
+        for _, name in ipairs(pins) do
+            local _, size_str, quant, last_run_str = get_model_row(config, name)
+            table.insert(pin_data, {
+                name = name,
+                size_str = size_str,
+                quant = quant,
+                last_run_str = last_run_str
+            })
+        end
+        
+        -- Calculate column widths and print
+        local max_name, max_size, max_quant = calculate_column_widths(pin_data)
+        for _, m in ipairs(pin_data) do
+            print("  " .. format_model_row(m, max_name, max_size, max_quant))
+        end
+        
     elseif args[1] == "doctor" then
         -- Run diagnostics
         print("luaLLM diagnostics")
@@ -1414,6 +1731,9 @@ local function main(args)
         print("  luallm <model>        Run a specific model")
         print("  luallm <model> ...    Run model with custom llama.cpp flags")
         print("  luallm info [model]   Show cached model metadata (interactive if no model)")
+        print("  luallm pin <model>    Pin a model for quick access")
+        print("  luallm unpin <model>  Unpin a model")
+        print("  luallm pinned         List pinned models")
         print("  luallm config         Show config file location")
         print("  luallm rebuild        Rebuild llama.cpp from source")
         print("  luallm clear-history  Clear run history")
@@ -1424,6 +1744,8 @@ local function main(args)
         print("  luallm                           # Pick from recent models")
         print("  luallm list                      # See all models")
         print("  luallm llama-3-8b                # Run specific model")
+        print("  luallm pin codellama             # Pin a model")
+        print("  luallm pinned                    # See pinned models")
         print("  luallm info                      # Pick model to view info")
         print("  luallm info llama-3-8b           # Show cached metadata")
         print("  luallm info llama-3-8b --kv      # Show structured KV data")
