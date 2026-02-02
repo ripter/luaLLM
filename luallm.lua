@@ -479,6 +479,147 @@ local function get_model_info_path(model_name)
     return MODEL_INFO_DIR .. "/" .. model_name .. ".json"
 end
 
+-- Minimal GGUF reader for extracting general.tags
+local function read_u32_le(file)
+    local bytes = file:read(4)
+    if not bytes or #bytes ~= 4 then return nil end
+    local b1, b2, b3, b4 = bytes:byte(1, 4)
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+end
+
+local function read_u64_le(file)
+    local bytes = file:read(8)
+    if not bytes or #bytes ~= 8 then return nil end
+    local b1, b2, b3, b4, b5, b6, b7, b8 = bytes:byte(1, 8)
+    -- Lua 5.1/5.2/5.3 safe: build up to 53-bit precision
+    return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216 + 
+           b5 * 4294967296 + b6 * 1099511627776 + 
+           b7 * 281474976710656 + b8 * 72057594037927936
+end
+
+local function read_gguf_string(file)
+    local len = read_u64_le(file)
+    if not len then return nil end
+    if len == 0 then return "" end
+    if len > 1000000 then -- Safety: don't allocate huge strings
+        file:seek("cur", len) -- Skip
+        return nil
+    end
+    return file:read(len)
+end
+
+local function skip_gguf_value(file, type_id)
+    -- GGUF type IDs (from spec)
+    -- 0=UINT8, 1=INT8, 2=UINT16, 3=INT16, 4=UINT32, 5=INT32, 
+    -- 6=FLOAT32, 7=BOOL, 8=STRING, 9=ARRAY, 10=UINT64, 11=INT64, 12=FLOAT64
+    
+    if type_id == 0 or type_id == 1 then -- UINT8/INT8
+        file:read(1)
+    elseif type_id == 2 or type_id == 3 then -- UINT16/INT16
+        file:read(2)
+    elseif type_id == 4 or type_id == 5 then -- UINT32/INT32
+        file:read(4)
+    elseif type_id == 6 then -- FLOAT32
+        file:read(4)
+    elseif type_id == 7 then -- BOOL
+        file:read(1)
+    elseif type_id == 8 then -- STRING
+        read_gguf_string(file)
+    elseif type_id == 10 or type_id == 11 then -- UINT64/INT64
+        file:read(8)
+    elseif type_id == 12 then -- FLOAT64
+        file:read(8)
+    elseif type_id == 9 then -- ARRAY
+        local elem_type = read_u32_le(file)
+        local count = read_u64_le(file)
+        if not elem_type or not count then return false end
+        
+        -- Skip array elements
+        for i = 1, count do
+            skip_gguf_value(file, elem_type)
+        end
+    else
+        return false -- Unknown type
+    end
+    return true
+end
+
+local function read_gguf_array(file, type_id)
+    -- Only handles ARRAY type
+    if type_id ~= 9 then return nil end
+    
+    local elem_type = read_u32_le(file)
+    local count = read_u64_le(file)
+    if not elem_type or not count then return nil end
+    
+    -- Only parse string arrays
+    if elem_type == 8 then -- STRING
+        local strings = {}
+        for i = 1, count do
+            local s = read_gguf_string(file)
+            if s then
+                table.insert(strings, s)
+            else
+                return nil -- Failed to read element
+            end
+        end
+        return strings
+    end
+    
+    return nil
+end
+
+local function read_gguf_general_tags(gguf_path)
+    local file = io.open(gguf_path, "rb")
+    if not file then return nil end
+    
+    local ok, result = pcall(function()
+        -- Read header
+        local magic = read_u32_le(file)
+        if not magic or magic ~= 0x46554747 then -- "GGUF" in little-endian
+            return nil
+        end
+        
+        local version = read_u32_le(file)
+        if not version or version < 2 then -- Need v2+
+            return nil
+        end
+        
+        local n_tensors = read_u64_le(file)
+        local n_kv = read_u64_le(file)
+        if not n_tensors or not n_kv then return nil end
+        
+        -- Read KV pairs, looking for general.tags
+        for i = 1, n_kv do
+            local key = read_gguf_string(file)
+            if not key then return nil end
+            
+            local type_id = read_u32_le(file)
+            if not type_id then return nil end
+            
+            if key == "general.tags" then
+                -- Found it! Read the array
+                return read_gguf_array(file, type_id)
+            else
+                -- Skip this value
+                if not skip_gguf_value(file, type_id) then
+                    return nil
+                end
+            end
+        end
+        
+        return nil -- Didn't find general.tags
+    end)
+    
+    file:close()
+    
+    if ok then
+        return result
+    else
+        return nil
+    end
+end
+
 local function save_model_info(config, model_name, captured_lines, run_config, end_reason, exit_code)
     ensure_model_info_dir()
     
@@ -508,6 +649,25 @@ local function save_model_info(config, model_name, captured_lines, run_config, e
     end
     if saw_ctx_line and kv["llama.context_length"] == nil then
         kv["_kv_parse_warning"] = "missing llama.context_length despite being in captured_lines"
+    end
+    
+    -- Populate full general.tags from GGUF file if captured version is partial/truncated
+    local tags_value = kv["general.tags"]
+    local needs_full_tags = false
+    
+    if not tags_value then
+        needs_full_tags = true
+    elseif type(tags_value) == "table" then
+        if tags_value.partial or tags_value.note == "truncated_in_output" then
+            needs_full_tags = true
+        end
+    end
+    
+    if needs_full_tags then
+        local full_tags = read_gguf_general_tags(model_path)
+        if full_tags and #full_tags > 0 then
+            kv["general.tags"] = full_tags
+        end
     end
     
     -- Build derived fields for tuning
