@@ -522,11 +522,27 @@ function M.rebuild_llama(config)
 end
 
 function M.handle_info_command(args, cfg)
-    local model_name = args[2]
-    local raw_mode = args[3] == "--raw"
-    local show_kv = args[3] == "--kv"
+    -- Parse flags and model query separately
+    local model_query = nil
+    local raw_mode = false
+    local show_kv = false
     
-    if not model_name then
+    -- Extract flags and model query from args
+    for i = 2, #args do
+        if args[i] == "--raw" then
+            raw_mode = true
+        elseif args[i] == "--kv" then
+            show_kv = true
+        elseif not model_query then
+            -- First non-flag argument is the model query
+            model_query = args[i]
+        end
+    end
+    
+    local model_name
+    
+    if not model_query then
+        -- No model specified - show interactive picker
         ensure_model_info_dir()
         local models_with_info = {}
         
@@ -558,6 +574,50 @@ function M.handle_info_command(args, cfg)
         
         model_name = selected
         io.write("\27[2J\27[H")
+    else
+        -- Model query provided - use fuzzy matching
+        local resolve = require("resolve")
+        local format = require("format")
+        local matches, match_type = resolve.find_matching_models(cfg, model_query)
+        
+        if #matches == 0 then
+            -- No matches
+            print("No model found matching: " .. model_query)
+            print()
+            print("Available models:")
+            local all_models = M.list_models(cfg.models_dir)
+            local suggestions = {}
+            for i = 1, math.min(10, #all_models) do
+                local _, size_str, quant, last_run_str = format.get_model_row(cfg, all_models[i].name)
+                table.insert(suggestions, {
+                    name = all_models[i].name,
+                    size_str = size_str,
+                    quant = quant,
+                    last_run_str = last_run_str
+                })
+            end
+            local max_name, max_size, max_quant = format.calculate_column_widths(suggestions)
+            for _, m in ipairs(suggestions) do
+                print("  " .. format.format_model_row(m, max_name, max_size, max_quant))
+            end
+            os.exit(1)
+        elseif #matches == 1 then
+            -- Exact match, use it
+            model_name = matches[1]
+        else
+            -- Multiple matches, show picker
+            print("Multiple models match '" .. model_query .. "':\n")
+            local match_models = {}
+            for _, name in ipairs(matches) do
+                table.insert(match_models, {name = name})
+            end
+            local selected = picker.show_picker(match_models, cfg, "Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):")
+            if selected then
+                model_name = selected
+            else
+                os.exit(0)
+            end
+        end
     end
     
     local info, status = M.load_model_info(model_name)
