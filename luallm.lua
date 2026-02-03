@@ -209,6 +209,7 @@ function print_help()
     print("  luallm rebuild            Rebuild llama.cpp from source")
     print("  luallm clear-history      Clear run history")
     print("  luallm doctor             Run diagnostics")
+    print("  luallm test               Run all src/*.test.lua tests")
     print("  luallm help               Show this help message")
     print()
     print("EXAMPLES:")
@@ -232,6 +233,13 @@ function print_help()
     print("  Location: " .. config.CONFIG_FILE)
     print("  Edit to customize model directory, llama.cpp path, defaults, etc.")
     print()
+end
+
+-- "test" is handled before main() so it never requires a config file.
+if arg[1] == "test" then
+    local script_dir = (arg[0]:match("^(.*)/[^/]+$") or ".")
+    local test_runner = require("test_runner")
+    test_runner.run_all(script_dir .. "/src")
 end
 
 local ok, err = xpcall(function()

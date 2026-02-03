@@ -46,8 +46,9 @@ make deps
 # Make executable
 chmod +x luallm.lua
 
-# Move to somewhere in your PATH
-sudo mv luallm.lua /usr/local/bin/luallm
+# Symlink into your PATH (do not move or copy — luallm.lua must stay
+# next to src/ so it can resolve its module imports)
+sudo ln -sf $(pwd)/luallm.lua /usr/local/bin/luallm
 ```
 
 ### Verify Installation

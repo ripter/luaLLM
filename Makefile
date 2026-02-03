@@ -2,16 +2,14 @@
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
-SHAREDIR = $(PREFIX)/share/luallm
 SCRIPT = luallm.lua
 TARGET = $(BINDIR)/luallm
-EXAMPLE_CONFIG = config.example.json
 
 help:
 	@echo "luaLLM - Makefile targets:"
 	@echo ""
 	@echo "  make deps      - Install Lua dependencies (lua-cjson, luafilesystem)"
-	@echo "  make install   - Install dependencies and copy script to $(BINDIR)"
+	@echo "  make install   - Install dependencies and symlink script to $(BINDIR)"
 	@echo "  make check     - Check if dependencies are installed"
 	@echo "  make uninstall - Remove installed script"
 	@echo "  make clean     - Remove local build artifacts"
@@ -44,11 +42,8 @@ install: deps
 	@chmod +x $(SCRIPT)
 	@echo "✓ Made $(SCRIPT) executable"
 	@mkdir -p $(BINDIR)
-	@mkdir -p $(SHAREDIR)
-	@cp $(SCRIPT) $(TARGET)
-	@echo "✓ Installed script to $(TARGET)"
-	@cp $(EXAMPLE_CONFIG) $(SHAREDIR)/$(EXAMPLE_CONFIG)
-	@echo "✓ Installed example config to $(SHAREDIR)/$(EXAMPLE_CONFIG)"
+	@ln -sf $$(pwd)/$(SCRIPT) $(TARGET)
+	@echo "✓ Symlinked $(TARGET) → $$(pwd)/$(SCRIPT)"
 	@echo ""
 	@echo "Installation complete! You can now run: luallm"
 	@echo ""
@@ -58,8 +53,7 @@ install: deps
 uninstall:
 	@echo "Uninstalling luallm..."
 	@rm -f $(TARGET)
-	@rm -rf $(SHAREDIR)
-	@echo "✓ Removed $(TARGET) and $(SHAREDIR)"
+	@echo "✓ Removed symlink $(TARGET)"
 	@echo ""
 	@echo "Config files remain at ~/.config/luaLLM/"
 	@echo "Run 'rm -rf ~/.config/luaLLM' to remove them."
