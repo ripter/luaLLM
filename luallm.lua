@@ -41,6 +41,7 @@ local picker = require("picker")
 local resolve = require("resolve")
 local model_info = require("model_info")
 local notes = require("notes")
+local bench = require("bench")
 
 -- Main command dispatcher
 local function main(args)
@@ -82,6 +83,9 @@ local function main(args)
         
     elseif args[1] == "notes" then
         notes.handle_notes_command(args, cfg)
+        
+    elseif args[1] == "bench" then
+        bench.handle_bench_command(args, cfg)
         
     elseif args[1] == "doctor" then
         handle_doctor_command(cfg)
@@ -197,6 +201,10 @@ function print_help()
     print("  luallm <model>            Run a specific model")
     print("  luallm <model> ...        Run model with custom llama.cpp flags")
     print("  luallm info [model]       Show cached model metadata (interactive if no model)")
+    print("  luallm bench <model>      Benchmark a model with llama-bench")
+    print("  luallm bench <model> --n N  Benchmark with N repeats")
+    print("  luallm bench <model> --n N --warmup W  Benchmark with warmup runs")
+    print("  luallm bench clear        Clear all benchmark logs")
     print("  luallm pin <model>        Pin a model for quick access")
     print("  luallm unpin <model>      Unpin a model")
     print("  luallm pinned             List pinned models")
@@ -216,6 +224,10 @@ function print_help()
     print("  luallm                           # Pick from recent models")
     print("  luallm list                      # See all models")
     print("  luallm llama-3-8b                # Run specific model")
+    print("  luallm bench mistral             # Benchmark model (5 runs, 1 warmup)")
+    print("  luallm bench mistral --n 10      # Benchmark with 10 runs")
+    print("  luallm bench mistral --n 10 --warmup 2  # 10 runs, 2 warmup")
+    print("  luallm bench clear               # Clear benchmark logs")
     print("  luallm pin codellama             # Pin a model")
     print("  luallm notes add mistral \"great for coding\"  # Add note")
     print("  luallm notes mistral             # View notes")

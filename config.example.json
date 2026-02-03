@@ -1,5 +1,7 @@
 {
   "llama_cpp_path": "/usr/local/bin/llama-server",
+  "llama_cli_path": "/usr/local/bin/llama-cli",
+  "llama_bench_path": "/usr/local/bin/llama-bench",
   "llama_cpp_source_dir": "/home/user/llama.cpp",
   "models_dir": "/home/user/models",
   "recent_models_count": 7,
@@ -9,6 +11,13 @@
     "--host 127.0.0.1",
     "--threads 8"
   ],
+  "bench": {
+    "default_n": 5,
+    "default_warmup": 1,
+    "default_ctx": 2048,
+    "default_gen": 256,
+    "default_batch": 512
+  },
   "cmake_options": [
     "-DGGML_METAL=ON",
     "-DGGML_METAL_EMBED_LIBRARY=ON",

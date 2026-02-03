@@ -1,15 +1,63 @@
--- format.test.lua — unit tests for the pure column-formatting helpers in format.lua
--- Does NOT touch the filesystem or history; only exercises
--- calculate_column_widths() and format_model_row().
+-- format.test.lua — unit tests for src/format.lua
 
-local format = require("format")
+local format       = require("format")
+local test_helpers = require("test_helpers")
 
-local function assert_eq(got, want, msg)
-    if got ~= want then
-        error(string.format("%s\n  got:  %q\n  want: %q", msg or "assertion failed", tostring(got), tostring(want)), 2)
-    end
+local assert_eq       = test_helpers.assert_eq
+local assert_contains = test_helpers.assert_contains
+local with_stubs      = test_helpers.with_stubs
+local capture_print   = test_helpers.capture_print
+
+-- ---------------------------------------------------------------------------
+-- regression: print_model_list must fall back to model_info.captured_at for
+-- sort order when a model has no history entry.
+-- ---------------------------------------------------------------------------
+local function test_print_model_list_sorts_by_model_info_fallback()
+    with_stubs({
+        format     = test_helpers.REMOVE,   -- force re-require against our stubs
+        util = {
+            expand_path = function(p) return p end,
+            path_attr   = function(_) return { size = 123456789 } end,
+            format_size = function(_) return "117.7MB" end,
+            format_time = function(ts) return "T" .. tostring(ts) end,
+        },
+        history = {
+            load_history = function()
+                return { { name = "ModelB-Q6_K", last_run = 10 } }
+            end,
+        },
+        model_info = {
+            load_model_info = function(name)
+                if name == "ModelA-Q6_K" then
+                    return { captured_at = 20 }
+                end
+                return nil
+            end,
+        },
+    }, function()
+        local format = require("format")
+        local config = { models_dir = "/models" }
+
+        -- ModelA has no history but captured_at=20; ModelB has last_run=10.
+        -- ModelA must sort first.
+        local printed = capture_print(function()
+            format.print_model_list({ "ModelA-Q6_K", "ModelB-Q6_K" }, "/models", config)
+        end)
+
+        if #printed < 2 then
+            error("expected at least 2 printed lines, got " .. tostring(#printed))
+        end
+
+        assert_contains(printed[1], "ModelA-Q6_K", "ModelA should sort first (captured_at fallback)")
+        assert_contains(printed[2], "ModelB-Q6_K", "ModelB should sort second")
+        assert_contains(printed[1], "T20",         "ModelA last_run_str should use captured_at")
+        assert_contains(printed[2], "T10",         "ModelB last_run_str should use history last_run")
+    end)
 end
 
+-- ---------------------------------------------------------------------------
+-- main
+-- ---------------------------------------------------------------------------
 return {
     run = function()
         -- ── calculate_column_widths ─────────────────────────────
@@ -22,15 +70,12 @@ return {
         local max_name, max_size, max_quant = format.calculate_column_widths(data)
 
         assert_eq(max_name,  #"a-much-longer-name",  "max_name")
-        assert_eq(max_size,  #"1.2GB",               "max_size — all size strings are 4-5 chars; 1.2GB is 5")
+        assert_eq(max_size,  #"1.2GB",               "max_size")
         assert_eq(max_quant, #"Q4_K_M",              "max_quant")
 
         -- ── format_model_row ────────────────────────────────────
-        -- Build a row for "short" and verify the padding lands correctly.
         local row = format.format_model_row(data[1], max_name, max_size, max_quant)
 
-        -- Expected layout:
-        --   "short" + (max_name - 5) spaces + "  " + "1.2GB" + (max_size - 5) spaces + "  " + "Q4_K_M" + (max_quant - 6) spaces + "  " + "never"
         local name_pad  = string.rep(" ", max_name  - #data[1].name)
         local size_pad  = string.rep(" ", max_size  - #data[1].size_str)
         local quant_pad = string.rep(" ", max_quant - #data[1].quant)
@@ -40,9 +85,8 @@ return {
                           data[1].last_run_str
         assert_eq(row, expected, "format_model_row padding for 'short'")
 
-        -- The longest-name row should have zero name-padding.
+        -- longest name → zero name-padding
         local row2 = format.format_model_row(data[2], max_name, max_size, max_quant)
-        -- name portion is exactly max_name chars (no extra spaces before the first "  ")
         assert_eq(row2:sub(1, max_name), data[2].name, "longest name fills column exactly")
 
         -- ── single-element list ─────────────────────────────────
@@ -52,12 +96,15 @@ return {
         assert_eq(ms, 2,  "single: max_size")
         assert_eq(mq, 2,  "single: max_quant")
         local row3 = format.format_model_row(single[1], mn, ms, mq)
-        assert_eq(row3, "x  1B  Q4  now", "single-element row is tight, no extra padding")
+        assert_eq(row3, "x  1B  Q4  now", "single-element row is tight")
 
         -- ── empty list ──────────────────────────────────────────
         local mn0, ms0, mq0 = format.calculate_column_widths({})
         assert_eq(mn0, 0, "empty: max_name")
         assert_eq(ms0, 0, "empty: max_size")
         assert_eq(mq0, 0, "empty: max_quant")
+
+        -- ── regression ──────────────────────────────────────────
+        test_print_model_list_sorts_by_model_info_fallback()
     end
 }
