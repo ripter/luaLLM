@@ -60,6 +60,10 @@ local function make_notes_stubs(notes_dir, resolver_stub)
             sh_quote = function(s)
                 return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
             end,
+            safe_filename = function(name)
+                -- Simple stub that just returns the name for testing
+                return name
+            end,
         },
         resolver = resolver_stub,
         format  = {

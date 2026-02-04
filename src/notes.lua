@@ -14,7 +14,8 @@ local function ensure_notes_dir()
 end
 
 local function get_notes_path(model_name)
-    return M.NOTES_DIR .. "/" .. model_name .. ".md"
+    local safe_name = util.safe_filename(model_name)
+    return M.NOTES_DIR .. "/" .. safe_name .. ".md"
 end
 
 local function has_notes(model_name)

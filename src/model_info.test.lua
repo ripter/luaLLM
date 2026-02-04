@@ -47,6 +47,10 @@ local function make_util_stub(json_store, path_attrs, is_dir_set)
             return path_attrs[path]   -- nil means file missing
         end,
         ensure_dir = function() end,
+        safe_filename = function(name)
+            -- Simple stub that just returns the name for testing
+            return name
+        end,
         file_exists = function(path)
             return json_store[path] ~= nil
         end,

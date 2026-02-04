@@ -15,7 +15,8 @@ local function ensure_model_info_dir()
 end
 
 local function get_model_info_path(model_name)
-    return M.MODEL_INFO_DIR .. "/" .. model_name .. ".json"
+    local safe_name = util.safe_filename(model_name)
+    return M.MODEL_INFO_DIR .. "/" .. safe_name .. ".json"
 end
 
 local function should_capture_line(line)

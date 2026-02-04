@@ -50,6 +50,55 @@ function M.is_dir(path)
     return attr and attr.mode == "directory"
 end
 
+function M.rm_rf(path)
+    -- Recursively remove directory or file
+    local attr = lfs.attributes(path)
+    if not attr then
+        return true  -- Already doesn't exist
+    end
+    
+    if attr.mode == "directory" then
+        -- Recursively delete directory contents
+        for entry in lfs.dir(path) do
+            if entry ~= "." and entry ~= ".." then
+                local entry_path = path .. "/" .. entry
+                local ok, err = M.rm_rf(entry_path)
+                if not ok then
+                    return false, err
+                end
+            end
+        end
+        -- Remove the now-empty directory
+        local ok, err = lfs.rmdir(path)
+        if not ok then
+            return false, "failed to remove directory: " .. (err or path)
+        end
+    else
+        -- Remove file
+        local ok, err = os.remove(path)
+        if not ok then
+            return false, "failed to remove file: " .. (err or path)
+        end
+    end
+    
+    return true
+end
+
+function M.safe_filename(name)
+    -- Replace unsafe characters with underscores
+    -- Keep alphanumeric, dash, underscore, dot
+    local safe = name:gsub("[^%w%.%-_]", "_")
+    -- Prevent directory traversal
+    safe = safe:gsub("%.%.", "__")
+    -- Trim dots from start/end
+    safe = safe:gsub("^%.+", ""):gsub("%.+$", "")
+    -- Ensure not empty
+    if safe == "" then
+        safe = "unnamed"
+    end
+    return safe
+end
+
 function M.expand_path(path)
     if path:sub(1, 1) == "~" then
         local home = os.getenv("HOME")
