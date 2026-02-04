@@ -38,10 +38,10 @@ local function make_exit_stub()
 end
 
 -- ---------------------------------------------------------------------------
--- Stub set builder.  notes.lua requires: lfs, util, config, format, resolve,
+-- Stub set builder.  notes.lua requires: lfs, util, config, format, resolver,
 -- picker.  We keep lfs *real* (temp dir has real files) and stub the rest.
 -- ---------------------------------------------------------------------------
-local function make_notes_stubs(notes_dir, resolve_stub)
+local function make_notes_stubs(notes_dir, resolver_stub)
     return {
         config  = { CONFIG_DIR = notes_dir },   -- NOTES_DIR = CONFIG_DIR .. "/notes"
         util    = {
@@ -61,7 +61,7 @@ local function make_notes_stubs(notes_dir, resolve_stub)
                 return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
             end,
         },
-        resolve = resolve_stub,
+        resolver = resolver_stub,
         format  = {
             get_model_row = function(_, name)
                 return name, "0B", "Q0", "never"
@@ -93,19 +93,15 @@ return { run = function()
     do
         local tmp = mkdtemp()
 
-        -- resolve stub: "mymodel" → single match
-        local resolve_stub = {
-            find_matching_models = function(_, query)
-                return { query }, nil
-            end,
+        -- resolver stub: resolve_or_exit returns the query directly
+        local resolver_stub = {
+            resolve_or_exit = function(cfg, query, opts)
+                return query  -- just return what was queried
+            end
         }
 
-        local exit_stub, _ = make_exit_stub()
-        local old_exit = os.exit
-        os.exit = exit_stub
-
         local notes
-        T.with_stubs(make_notes_stubs(tmp, resolve_stub), function()
+        T.with_stubs(make_notes_stubs(tmp, resolver_stub), function()
             notes = require("notes")
         end)
 
@@ -113,8 +109,6 @@ return { run = function()
         local printed = T.capture_print(function()
             notes.handle_notes_command({"notes", "add", "mymodel", "hello", "world"}, { models_dir = tmp })
         end)
-
-        os.exit = old_exit
 
         -- confirm "Note added" was printed
         local found_added = false
@@ -141,16 +135,12 @@ return { run = function()
     -- ── 2. notes add: second note appends without overwriting ───────────
     do
         local tmp = mkdtemp()
-        local resolve_stub = {
-            find_matching_models = function(_, query) return { query }, nil end,
+        local resolver_stub = {
+            resolve_or_exit = function(cfg, query, opts) return query end
         }
 
-        local exit_stub, _ = make_exit_stub()
-        local old_exit = os.exit
-        os.exit = exit_stub
-
         local notes
-        T.with_stubs(make_notes_stubs(tmp, resolve_stub), function()
+        T.with_stubs(make_notes_stubs(tmp, resolver_stub), function()
             notes = require("notes")
         end)
 
@@ -160,8 +150,6 @@ return { run = function()
         T.capture_print(function()
             notes.handle_notes_command({"notes", "add", "m1", "second note"}, {})
         end)
-
-        os.exit = old_exit
 
         local f = io.open(tmp .. "/notes/m1.md", "r")
         local content = f:read("*all")
@@ -187,24 +175,18 @@ return { run = function()
         f2:write("# BetaModel\n\n## Notes\n\n## Summary\n")
         f2:close()
 
-        local resolve_stub = {
-            find_matching_models = function(_, query) return { query }, nil end,
+        local resolver_stub = {
+            resolve_or_exit = function(cfg, query, opts) return query end
         }
 
-        local exit_stub, _ = make_exit_stub()
-        local old_exit = os.exit
-        os.exit = exit_stub
-
         local notes
-        T.with_stubs(make_notes_stubs(tmp, resolve_stub), function()
+        T.with_stubs(make_notes_stubs(tmp, resolver_stub), function()
             notes = require("notes")
         end)
 
         local printed = T.capture_print(function()
             notes.handle_notes_command({"notes", "list"}, {})
         end)
-
-        os.exit = old_exit
 
         -- join all printed lines to search
         local all_output = table.concat(printed, "\n")
@@ -217,8 +199,8 @@ return { run = function()
     -- ── 4. notes add with missing text → exits non-zero ─────────────────
     do
         local tmp = mkdtemp()
-        local resolve_stub = {
-            find_matching_models = function(_, query) return { query }, nil end,
+        local resolver_stub = {
+            resolve_or_exit = function(cfg, query, opts) return query end
         }
 
         local exit_stub, exits = make_exit_stub()
@@ -226,7 +208,7 @@ return { run = function()
         os.exit = exit_stub
 
         local notes
-        T.with_stubs(make_notes_stubs(tmp, resolve_stub), function()
+        T.with_stubs(make_notes_stubs(tmp, resolver_stub), function()
             notes = require("notes")
         end)
 
@@ -254,8 +236,8 @@ return { run = function()
         -- notes dir exists but is empty
         os.execute("mkdir -p " .. tmp .. "/notes")
 
-        local resolve_stub = {
-            find_matching_models = function(_, query) return { query }, nil end,
+        local resolver_stub = {
+            resolve_or_exit = function(cfg, query, opts) return query end
         }
 
         local exit_stub, exits = make_exit_stub()
@@ -263,7 +245,7 @@ return { run = function()
         os.exit = exit_stub
 
         local notes
-        T.with_stubs(make_notes_stubs(tmp, resolve_stub), function()
+        T.with_stubs(make_notes_stubs(tmp, resolver_stub), function()
             notes = require("notes")
         end)
 

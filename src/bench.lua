@@ -1,10 +1,13 @@
 -- bench.lua
--- Benchmark module for luaLLM using llama-bench
+-- Benchmark module for luaLLM using llama-bench with JSON output
 
 local lfs = require("lfs")
+local json = require("cjson")
 local util = require("util")
 local config = require("config")
 local resolver = require("resolver")
+local format = require("format")
+local picker = require("picker")
 
 local M = {}
 
@@ -70,20 +73,102 @@ local function get_bench_log_path(model_name)
     return M.BENCH_DIR .. "/" .. model_name .. ".json"
 end
 
+local function list_models_with_bench_logs()
+    ensure_bench_dir()
+    local models = {}
+    
+    if not util.is_dir(M.BENCH_DIR) then
+        return {}
+    end
+    
+    for file in lfs.dir(M.BENCH_DIR) do
+        if file:match("%.json$") then
+            local name = file:gsub("%.json$", "")
+            table.insert(models, name)
+        end
+    end
+    
+    table.sort(models)
+    return models
+end
+
 -- ---------------------------------------------------------------------------
--- Metrics parsing
+-- JSON parsing from llama-bench
 -- ---------------------------------------------------------------------------
 
-local function parse_metrics(output)
-    local metrics = {}
+local function parse_json_results(output)
+    -- llama-bench might print non-JSON lines before the JSON output
+    -- Find the actual JSON portion (starts with [ or {)
+    local json_start = output:find("[{[]")
+    if json_start then
+        output = output:sub(json_start)
+    end
     
-    -- llama-bench outputs a markdown-style table like:
-    -- | model | size | params | backend | threads | n_batch | test | t/s |
-    -- | ...   | ...  | ...    | ...     | ...     | ...     | pp2048 | 216.49 ± 0.93 |
-    -- | ...   | ...  | ...    | ...     | ...     | ...     | tg256  | 18.46 ± 0.35 |
-    --
-    -- Or older formats with columns like:
-    -- | pp 512 | tg 128 | pl 512 | 1 | pp 1234.56 ± 0.00 | tg 567.89 ± 0.00 |
+    local ok, data = pcall(json.decode, output)
+    if not ok then
+        return nil, "failed to parse JSON: " .. tostring(data)
+    end
+    
+    -- llama-bench JSON can be either an array directly or an object with results
+    local results_array
+    if type(data) == "table" then
+        if data.results then
+            results_array = data.results
+        elseif #data >= 0 then
+            -- It's an array (could be empty)
+            results_array = data
+        else
+            return nil, "JSON missing 'results' array and is not an array itself"
+        end
+    else
+        return nil, "JSON root is not a table"
+    end
+    
+    if not results_array or type(results_array) ~= "table" then
+        return nil, "results is not an array"
+    end
+    
+    local pp_values = {}
+    local tg_values = {}
+    local reported_threads = nil
+    local build_info = {
+        commit = data.build_commit,
+        number = data.build_number
+    }
+    
+    for _, result in ipairs(results_array) do
+        -- Extract test type from result
+        -- llama-bench JSON has fields like: test, n_prompt, n_gen, avg_ts (tokens/sec)
+        local is_pp = result.n_prompt and result.n_prompt > 0 and (not result.n_gen or result.n_gen == 0)
+        local is_tg = result.n_gen and result.n_gen > 0
+        
+        if result.avg_ts then
+            if is_pp then
+                table.insert(pp_values, result.avg_ts)
+            elseif is_tg then
+                table.insert(tg_values, result.avg_ts)
+            end
+        end
+        
+        -- Extract threads if available
+        if not reported_threads and result.n_threads then
+            reported_threads = result.n_threads
+        end
+    end
+    
+    return {
+        pp_values = pp_values,
+        tg_values = tg_values,
+        reported_threads = reported_threads,
+        build_info = build_info
+    }
+end
+
+-- Parse markdown table output (fallback for older llama-bench versions)
+local function parse_markdown_table(output)
+    local pp_values = {}
+    local tg_values = {}
+    local reported_threads = nil
     
     for line in output:gmatch("[^\n]+") do
         -- New table format: split by | and check last two columns
@@ -103,53 +188,44 @@ local function parse_metrics(output)
                 
                 -- Check if test_col is pp* or tg*
                 if test_col:match("^pp%d+") then
-                    -- Parse t/s column: "216.49 ± 0.93" -> 216.49
                     local value = tps_col:match("([%d.]+)%s*±")
                     if value then
-                        metrics.pp_tps = tonumber(value)
+                        table.insert(pp_values, tonumber(value))
                     end
                 elseif test_col:match("^tg%d+") then
                     local value = tps_col:match("([%d.]+)%s*±")
                     if value then
-                        metrics.tg_tps = tonumber(value)
+                        table.insert(tg_values, tonumber(value))
+                    end
+                end
+                
+                -- Try to extract threads from threads column
+                if not reported_threads then
+                    for _, col in ipairs(columns) do
+                        local t = tonumber(col)
+                        if t and t > 0 and t < 256 then  -- reasonable thread count
+                            -- This is a heuristic - might be threads
+                            if col:match("^%d+$") and #columns > 5 then
+                                reported_threads = t
+                            end
+                        end
                     end
                 end
             end
         end
-        
-        -- Fallback: older formats
-        -- Try: "| pp 1234.56 ± ... |" pattern
-        if not metrics.pp_tps then
-            local pp_tps = line:match("|%s*pp%s+([%d.]+)%s+±")
-            if pp_tps then
-                metrics.pp_tps = tonumber(pp_tps)
-            end
-        end
-        
-        if not metrics.tg_tps then
-            local tg_tps = line:match("|%s*tg%s+([%d.]+)%s+±")
-            if tg_tps then
-                metrics.tg_tps = tonumber(tg_tps)
-            end
-        end
-        
-        -- Fallback: look for patterns like "pp: 1234.56 t/s" or "tg: 567.89 t/s"
-        if not metrics.pp_tps then
-            local pp = line:match("pp[:%s]+([%d.]+)%s*t/s")
-            if pp then metrics.pp_tps = tonumber(pp) end
-        end
-        
-        if not metrics.tg_tps then
-            local tg = line:match("tg[:%s]+([%d.]+)%s*t/s")
-            if tg then metrics.tg_tps = tonumber(tg) end
-        end
     end
     
-    return metrics
+    if #pp_values > 0 or #tg_values > 0 then
+        return {
+            pp_values = pp_values,
+            tg_values = tg_values,
+            reported_threads = reported_threads,
+            build_info = {}
+        }
+    end
+    
+    return nil
 end
-
--- Expose for testing
-M._parse_metrics_for_test = parse_metrics
 
 -- ---------------------------------------------------------------------------
 -- Stats computation
@@ -177,43 +253,53 @@ local function compute_stats(values)
     }
 end
 
-local function aggregate_metrics(runs, metric_key)
-    local values = {}
-    for _, run in ipairs(runs) do
-        if run[metric_key] then
-            table.insert(values, run[metric_key])
-        end
-    end
-    return compute_stats(values)
-end
-
 -- ---------------------------------------------------------------------------
 -- Benchmark execution
 -- ---------------------------------------------------------------------------
 
-local function run_single_bench(bench_path, model_path, ctx, gen, batch)
-    -- llama-bench takes flags like: -m model.gguf -p 512 -n 256 -b 512
-    -- where -p is prompt tokens (ctx), -n is gen tokens, -b is batch
+local function run_bench_with_json(bench_path, model_path, threads, repeats)
+    -- Build minimal llama-bench command
+    -- llama-bench will auto-run standard tests (pp512, tg128 by default)
     local cmd_parts = {
         util.sh_quote(bench_path),
         "-m", util.sh_quote(model_path),
-        "-p", tostring(ctx),
-        "-n", tostring(gen),
-        "-b", tostring(batch),
-        "-ngl", "999",  -- try to offload everything
+        "-o", "json",
     }
+    
+    -- Add threads if specified
+    if threads and threads > 0 then
+        table.insert(cmd_parts, "-t")
+        table.insert(cmd_parts, string.format("%d", threads))
+    end
+    
+    -- Add repetitions if specified
+    if repeats and repeats > 1 then
+        table.insert(cmd_parts, "-r")
+        table.insert(cmd_parts, string.format("%d", repeats))
+    end
     
     local cmd = table.concat(cmd_parts, " ") .. " 2>&1"
     
     local handle = io.popen(cmd)
     if not handle then
-        return nil, nil
+        return nil, nil, "failed to run llama-bench"
     end
     
     local output = handle:read("*all")
     handle:close()
     
-    return parse_metrics(output), output
+    -- Check if output looks like help/error
+    if output:match("^usage:") or output:match("^  %-") or output:match("Multiple values can be given") then
+        return nil, output, "llama-bench printed help/error - check installation"
+    end
+    
+    -- Try to parse JSON
+    local parsed, err = parse_json_results(output)
+    if not parsed then
+        return nil, output, err
+    end
+    
+    return parsed, output, nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -221,7 +307,9 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.handle_bench_command(args, cfg)
-    if args[2] == "clear" then
+    local subcommand = args[2]
+    
+    if subcommand == "clear" then
         if util.is_dir(M.BENCH_DIR) then
             os.execute("rm -rf " .. util.sh_quote(M.BENCH_DIR))
             print("✓ Cleared bench logs: " .. M.BENCH_DIR)
@@ -231,10 +319,22 @@ function M.handle_bench_command(args, cfg)
         return
     end
     
-    -- Parse args
+    if subcommand == "show" then
+        M.handle_bench_show(args, cfg)
+        return
+    end
+    
+    if subcommand == "compare" then
+        M.handle_bench_compare(args, cfg)
+        return
+    end
+    
+    -- Default: run bench
     if #args < 2 then
         print("Error: Missing model name")
-        print("Usage: luallm bench <model> [--n N] [--warmup W] [--ctx C] [--gen G] [--batch B]")
+        print("Usage: luallm bench <model> [--n N] [--warmup W] [--threads T]")
+        print("       luallm bench show [model]")
+        print("       luallm bench compare <modelA> <modelB>")
         print("       luallm bench clear")
         os.exit(1)
     end
@@ -245,9 +345,7 @@ function M.handle_bench_command(args, cfg)
     local bench_cfg = cfg.bench or {}
     local n_repeats = bench_cfg.default_n or 5
     local warmup_runs = bench_cfg.default_warmup or 1
-    local ctx = bench_cfg.default_ctx or 2048
-    local gen = bench_cfg.default_gen or 256
-    local batch = bench_cfg.default_batch or 512
+    local threads = bench_cfg.default_threads or 8
     
     local i = 3
     while i <= #args do
@@ -265,14 +363,8 @@ function M.handle_bench_command(args, cfg)
                 os.exit(1)
             end
             i = i + 2
-        elseif args[i] == "--ctx" and args[i+1] then
-            ctx = tonumber(args[i+1])
-            i = i + 2
-        elseif args[i] == "--gen" and args[i+1] then
-            gen = tonumber(args[i+1])
-            i = i + 2
-        elseif args[i] == "--batch" and args[i+1] then
-            batch = tonumber(args[i+1])
+        elseif (args[i] == "--threads" or args[i] == "-t") and args[i+1] then
+            threads = tonumber(args[i+1])
             i = i + 2
         else
             i = i + 1
@@ -316,9 +408,8 @@ function M.handle_bench_command(args, cfg)
     print("Settings:")
     print("  Repeats: " .. n_repeats)
     print("  Warmup:  " .. warmup_runs)
-    print("  Context: " .. ctx)
-    print("  Gen:     " .. gen)
-    print("  Batch:   " .. batch)
+    print("  Note: llama-bench uses its own default test sizes")
+    print("  Threads: " .. threads)
     print()
     print("Tool: " .. bench_path)
     print()
@@ -329,82 +420,67 @@ function M.handle_bench_command(args, cfg)
         for i = 1, warmup_runs do
             io.write(string.format("  Warmup %d/%d... ", i, warmup_runs))
             io.flush()
-            local metrics, _ = run_single_bench(bench_path, model_path, ctx, gen, batch)
-            if metrics and (metrics.pp_tps or metrics.tg_tps) then
+            local parsed, _, err = run_bench_with_json(bench_path, model_path, threads, 1)
+            if parsed and (#parsed.pp_values > 0 or #parsed.tg_values > 0) then
                 io.write("OK\n")
             else
-                io.write("FAILED\n")
+                io.write("FAILED" .. (err and (" (" .. err .. ")") or "") .. "\n")
             end
         end
         print()
     end
     
-    -- Run measured benchmarks
-    print("Measured runs...")
-    local runs = {}
-    local all_output = {}
+    -- Run measured benchmark (single call with repeats)
+    print("Running benchmark with " .. n_repeats .. " repetitions...")
+    io.flush()
     
-    for run_idx = 1, n_repeats do
-        io.write(string.format("  Run %d/%d... ", run_idx, n_repeats))
-        io.flush()
-        
-        local metrics, raw_output = run_single_bench(bench_path, model_path, ctx, gen, batch)
-        
-        if run_idx == 1 then
-            -- Save output for debugging
-            for line in raw_output:gmatch("[^\n]+") do
-                table.insert(all_output, line)
-            end
-        end
-        
-        if metrics and (metrics.pp_tps or metrics.tg_tps) then
-            table.insert(runs, metrics)
-            local pp = metrics.pp_tps and string.format("pp=%.1f", metrics.pp_tps) or "pp=N/A"
-            local tg = metrics.tg_tps and string.format("tg=%.1f", metrics.tg_tps) or "tg=N/A"
-            io.write(string.format("%s %s t/s\n", pp, tg))
-        else
-            io.write("FAILED (no metrics)\n")
-            -- Show tail of output on first failure
-            if run_idx == 1 and raw_output then
-                print("  Debug: Last 600 chars of output:")
-                local start = math.max(1, #raw_output - 600)
-                print("  " .. raw_output:sub(start):gsub("\n", "\n  "))
-            end
-        end
-    end
+    local parsed, raw_output, err = run_bench_with_json(bench_path, model_path, threads, n_repeats)
     
-    if #runs == 0 then
+    if not parsed or err then
         print()
-        print("✗ All runs failed. Check llama-bench output above.")
+        print("✗ Benchmark failed: " .. (err or "unknown error"))
+        if raw_output then
+            print()
+            print("Last 800 chars of output:")
+            local start = math.max(1, #raw_output - 800)
+            print(raw_output:sub(start))
+        end
         os.exit(1)
     end
     
     -- Compute stats
-    local stats = {
-        pp_tps = aggregate_metrics(runs, "pp_tps"),
-        tg_tps = aggregate_metrics(runs, "tg_tps")
-    }
+    local pp_stats = compute_stats(parsed.pp_values)
+    local tg_stats = compute_stats(parsed.tg_values)
+    
+    if not pp_stats and not tg_stats then
+        print()
+        print("✗ No metrics found in benchmark output")
+        os.exit(1)
+    end
     
     -- Print summary
     print()
     print("Results:")
-    if stats.pp_tps then
+    if pp_stats then
         print(string.format("  Prompt processing:  avg=%.1f  min=%.1f  max=%.1f t/s",
-            stats.pp_tps.avg, stats.pp_tps.min, stats.pp_tps.max))
+            pp_stats.avg, pp_stats.min, pp_stats.max))
     end
-    if stats.tg_tps then
+    if tg_stats then
         print(string.format("  Token generation:   avg=%.1f  min=%.1f  max=%.1f t/s",
-            stats.tg_tps.avg, stats.tg_tps.min, stats.tg_tps.max))
+            tg_stats.avg, tg_stats.min, tg_stats.max))
     end
+    
+    -- Check threads mismatch
+    if parsed.reported_threads and parsed.reported_threads ~= threads then
+        print()
+        print(string.format("⚠ Warning: Requested threads=%d, llama-bench reported=%d", 
+            threads, parsed.reported_threads))
+        print("  (check CPU affinity / system limits)")
+    end
+    
     print()
     
-    -- Save results (keep last ~200 lines of output)
-    local raw_tail = {}
-    local tail_start = math.max(1, #all_output - 200)
-    for i = tail_start, #all_output do
-        table.insert(raw_tail, all_output[i])
-    end
-    
+    -- Save results
     local bench_results = {
         schema_version = 1,
         tool = "llama-bench",
@@ -416,17 +492,23 @@ function M.handle_bench_command(args, cfg)
         bench_config = {
             n = n_repeats,
             warmup = warmup_runs,
-            ctx = ctx,
-            gen = gen,
-            batch = batch
+            threads_requested = threads,
+            threads_reported = parsed.reported_threads,
+            note = "llama-bench uses default test sizes (typically pp512, tg128)"
         },
         run_config = {
             llama_bench_path = bench_path,
-            argv_template = {bench_path, "-m", model_path, "-p", tostring(ctx), "-n", tostring(gen), "-b", tostring(batch), "-ngl", "999"}
+            build_info = parsed.build_info,
+            argv_template = {bench_path, "-m", model_path, "-t", tostring(threads), "-r", tostring(n_repeats), "-o", "json"}
         },
-        runs = runs,
-        stats = stats,
-        raw_tail = raw_tail
+        results = {
+            pp_values = parsed.pp_values,
+            tg_values = parsed.tg_values
+        },
+        stats = {
+            pp = pp_stats,
+            tg = tg_stats
+        }
     }
     
     ensure_bench_dir()
@@ -436,5 +518,228 @@ function M.handle_bench_command(args, cfg)
     print("✓ Benchmark complete")
     print("Results saved to: " .. log_path)
 end
+
+-- ---------------------------------------------------------------------------
+-- bench show command
+-- ---------------------------------------------------------------------------
+
+function M.handle_bench_show(args, cfg)
+    local model_query = args[3]
+    local model_name
+    
+    if not model_query then
+        -- No model specified - show picker of models with bench logs
+        local models_with_bench = list_models_with_bench_logs()
+        
+        if #models_with_bench == 0 then
+            print("No benchmark logs found.")
+            print("Run 'luallm bench <model>' to create benchmarks.")
+            os.exit(0)
+        end
+        
+        local bench_models = {}
+        for _, name in ipairs(models_with_bench) do
+            table.insert(bench_models, {name = name})
+        end
+        
+        model_name = picker.show_picker(bench_models, cfg, "Select a model to view bench results (↑/↓ arrows, Enter to confirm, q to quit):")
+        
+        if not model_name then
+            os.exit(0)
+        end
+    else
+        -- Model specified - resolve it
+        model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model to view bench results (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
+    end
+    
+    -- Load bench log
+    local log_path = get_bench_log_path(model_name)
+    local bench_data = util.load_json(log_path)
+    
+    if not bench_data then
+        print("No benchmark results found for: " .. model_name)
+        print("Run: luallm bench " .. model_name)
+        os.exit(1)
+    end
+    
+    -- Display results
+    print()
+    print("Benchmark Results: " .. model_name)
+    print()
+    
+    -- Model info
+    local _, size_str, quant, last_run_str = format.get_model_row(cfg, model_name)
+    print("Model:   " .. model_name)
+    print("Size:    " .. (bench_data.gguf_size_bytes and util.format_size(bench_data.gguf_size_bytes) or size_str))
+    print("Quant:   " .. quant)
+    if bench_data.ran_at then
+        print("Tested:  " .. os.date("%Y-%m-%d %H:%M:%S", bench_data.ran_at))
+    end
+    print()
+    
+    -- Bench config
+    local bc = bench_data.bench_config or {}
+    print("Configuration:")
+    print("  Repeats:         " .. (bc.n or "?"))
+    print("  Warmup:          " .. (bc.warmup or "?"))
+    if bc.note then
+        print("  " .. bc.note)
+    end
+    if bc.threads_requested then
+        local threads_str = tostring(bc.threads_requested)
+        if bc.threads_reported and bc.threads_reported ~= bc.threads_requested then
+            threads_str = threads_str .. " (reported: " .. bc.threads_reported .. ")"
+        end
+        print("  Threads:         " .. threads_str)
+    end
+    print()
+    
+    -- Results
+    print("Performance:")
+    local stats = bench_data.stats or {}
+    if stats.pp then
+        print(string.format("  Prompt processing: avg=%.1f  min=%.1f  max=%.1f t/s",
+            stats.pp.avg, stats.pp.min, stats.pp.max))
+    else
+        print("  Prompt processing: N/A")
+    end
+    
+    if stats.tg then
+        print(string.format("  Token generation:  avg=%.1f  min=%.1f  max=%.1f t/s",
+            stats.tg.avg, stats.tg.min, stats.tg.max))
+    else
+        print("  Token generation:  N/A")
+    end
+    print()
+    
+    -- Build info
+    if bench_data.run_config and bench_data.run_config.build_info then
+        local bi = bench_data.run_config.build_info
+        if bi.commit or bi.number then
+            print("Build:")
+            if bi.commit then print("  Commit: " .. bi.commit) end
+            if bi.number then print("  Number: " .. bi.number) end
+            print()
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- bench compare command
+-- ---------------------------------------------------------------------------
+
+function M.handle_bench_compare(args, cfg)
+    if #args < 4 then
+        print("Error: Missing model names")
+        print("Usage: luallm bench compare <modelA> <modelB>")
+        os.exit(1)
+    end
+    
+    local model_a_query = args[3]
+    local model_b_query = args[4]
+    
+    -- Resolve both models
+    local model_a = resolver.resolve_or_exit(cfg, model_a_query, {
+        title = "Select first model to compare (↑/↓ arrows, Enter to confirm, q to quit):"
+    })
+    
+    local model_b = resolver.resolve_or_exit(cfg, model_b_query, {
+        title = "Select second model to compare (↑/↓ arrows, Enter to confirm, q to quit):"
+    })
+    
+    -- Load bench logs
+    local log_a = util.load_json(get_bench_log_path(model_a))
+    local log_b = util.load_json(get_bench_log_path(model_b))
+    
+    if not log_a then
+        print("No benchmark results found for: " .. model_a)
+        print("Run: luallm bench " .. model_a)
+        os.exit(1)
+    end
+    
+    if not log_b then
+        print("No benchmark results found for: " .. model_b)
+        print("Run: luallm bench " .. model_b)
+        os.exit(1)
+    end
+    
+    -- Display comparison
+    print()
+    print("Benchmark Comparison")
+    print()
+    
+    -- Model headers
+    local _, size_a, quant_a = format.get_model_row(cfg, model_a)
+    local _, size_b, quant_b = format.get_model_row(cfg, model_b)
+    
+    print("A: " .. model_a)
+    print("   Size: " .. (log_a.gguf_size_bytes and util.format_size(log_a.gguf_size_bytes) or size_a) .. 
+          "  Quant: " .. quant_a .. 
+          (log_a.ran_at and ("  Tested: " .. os.date("%Y-%m-%d %H:%M", log_a.ran_at)) or ""))
+    print()
+    print("B: " .. model_b)
+    print("   Size: " .. (log_b.gguf_size_bytes and util.format_size(log_b.gguf_size_bytes) or size_b) .. 
+          "  Quant: " .. quant_b .. 
+          (log_b.ran_at and ("  Tested: " .. os.date("%Y-%m-%d %H:%M", log_b.ran_at)) or ""))
+    print()
+    
+    -- Check config differences
+    local bc_a = log_a.bench_config or {}
+    local bc_b = log_b.bench_config or {}
+    local config_differs = false
+    
+    if bc_a.ctx ~= bc_b.ctx or bc_a.gen ~= bc_b.gen or 
+       bc_a.batch ~= bc_b.batch or bc_a.threads_requested ~= bc_b.threads_requested or
+       bc_a.n ~= bc_b.n then
+        config_differs = true
+        print("⚠ Warning: Benchmark configurations differ; comparison may be misleading")
+        print()
+    end
+    
+    -- Performance comparison
+    print("Performance:")
+    print()
+    
+    local stats_a = log_a.stats or {}
+    local stats_b = log_b.stats or {}
+    
+    -- PP comparison
+    if stats_a.pp and stats_b.pp then
+        local pp_a = stats_a.pp
+        local pp_b = stats_b.pp
+        local delta_abs = pp_b.avg - pp_a.avg
+        local delta_pct = (delta_abs / pp_a.avg) * 100
+        
+        print(string.format("  PP t/s:  A %.1f (%.1f–%.1f)  |  B %.1f (%.1f–%.1f)  |  Δ %+.1f (%+.1f%%)",
+            pp_a.avg, pp_a.min, pp_a.max,
+            pp_b.avg, pp_b.min, pp_b.max,
+            delta_abs, delta_pct))
+    else
+        print("  PP t/s:  N/A")
+    end
+    
+    -- TG comparison
+    if stats_a.tg and stats_b.tg then
+        local tg_a = stats_a.tg
+        local tg_b = stats_b.tg
+        local delta_abs = tg_b.avg - tg_a.avg
+        local delta_pct = (delta_abs / tg_a.avg) * 100
+        
+        print(string.format("  TG t/s:  A %.1f (%.1f–%.1f)  |  B %.1f (%.1f–%.1f)  |  Δ %+.1f (%+.1f%%)",
+            tg_a.avg, tg_a.min, tg_a.max,
+            tg_b.avg, tg_b.min, tg_b.max,
+            delta_abs, delta_pct))
+    else
+        print("  TG t/s:  N/A")
+    end
+    
+    print()
+end
+
+-- Expose parse functions for testing
+M._parse_json_for_test = parse_json_results
+M._parse_markdown_for_test = parse_markdown_table
 
 return M

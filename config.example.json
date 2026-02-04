@@ -16,7 +16,8 @@
     "default_warmup": 1,
     "default_ctx": 2048,
     "default_gen": 256,
-    "default_batch": 512
+    "default_batch": 512,
+    "default_threads": 8
   },
   "cmake_options": [
     "-DGGML_METAL=ON",
