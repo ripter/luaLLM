@@ -2,7 +2,7 @@ local lfs = require("lfs")
 local util = require("util")
 local config = require("config")
 local format = require("format")
-local resolve = require("resolve")
+local resolver = require("resolver")
 local picker = require("picker")
 
 local M = {}
@@ -165,23 +165,10 @@ function M.handle_notes_command(args, cfg)
         end
         
         local model_query = args[3]
-        local matches, match_type = resolve.find_matching_models(cfg, model_query)
-        
-        if #matches == 0 then
-            print("No model found matching: " .. model_query)
-            os.exit(1)
-        elseif #matches == 1 then
-            print(get_notes_path(matches[1]))
-        else
-            local match_models = {}
-            for _, name in ipairs(matches) do
-                table.insert(match_models, {name = name})
-            end
-            local selected = picker.show_picker(match_models, cfg, "Select a model (↑/↓ arrows, Enter to confirm, q to quit):")
-            if selected then
-                print(get_notes_path(selected))
-            end
-        end
+        local model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
+        print(get_notes_path(model_name))
         
     elseif subcommand == "add" then
         if #args < 4 then
@@ -197,34 +184,16 @@ function M.handle_notes_command(args, cfg)
         end
         local note_text = table.concat(note_parts, " ")
         
-        local matches, match_type = resolve.find_matching_models(cfg, model_query)
+        local model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model to add note (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
         
-        if #matches == 0 then
-            print("No model found matching: " .. model_query)
-            os.exit(1)
-        elseif #matches == 1 then
-            local ok, err = add_note(matches[1], note_text)
-            if ok then
-                print("Note added to " .. matches[1])
-            else
-                print("Error: " .. err)
-                os.exit(1)
-            end
+        local ok, err = add_note(model_name, note_text)
+        if ok then
+            print("Note added to " .. model_name)
         else
-            local match_models = {}
-            for _, name in ipairs(matches) do
-                table.insert(match_models, {name = name})
-            end
-            local selected = picker.show_picker(match_models, cfg, "Select a model to add note (↑/↓ arrows, Enter to confirm, q to quit):")
-            if selected then
-                local ok, err = add_note(selected, note_text)
-                if ok then
-                    print("Note added to " .. selected)
-                else
-                    print("Error: " .. err)
-                    os.exit(1)
-                end
-            end
+            print("Error: " .. err)
+            os.exit(1)
         end
         
     elseif subcommand == "edit" then
@@ -236,71 +205,32 @@ function M.handle_notes_command(args, cfg)
             os.exit(1)
         end
         
-        local matches, match_type = resolve.find_matching_models(cfg, model_query)
+        local model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model to edit notes (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
         
-        if #matches == 0 then
-            print("No model found matching: " .. model_query)
-            os.exit(1)
-        elseif #matches == 1 then
-            local model_name = matches[1]
-            local notes_path = get_notes_path(model_name)
-            
-            if not util.file_exists(notes_path) then
-                init_notes_file(model_name)
-            end
-            
-            local editor = os.getenv("EDITOR") or "vi"
-            local cmd = editor .. " " .. util.sh_quote(notes_path)
-            os.execute(cmd)
-        else
-            local match_models = {}
-            for _, name in ipairs(matches) do
-                table.insert(match_models, {name = name})
-            end
-            local selected = picker.show_picker(match_models, cfg, "Select a model to edit notes (↑/↓ arrows, Enter to confirm, q to quit):")
-            if selected then
-                local notes_path = get_notes_path(selected)
-                
-                if not util.file_exists(notes_path) then
-                    init_notes_file(selected)
-                end
-                
-                local editor = os.getenv("EDITOR") or "vi"
-                local cmd = editor .. " " .. util.sh_quote(notes_path)
-                os.execute(cmd)
-            end
+        local notes_path = get_notes_path(model_name)
+        
+        if not util.file_exists(notes_path) then
+            init_notes_file(model_name)
         end
+        
+        local editor = os.getenv("EDITOR") or "vi"
+        local cmd = editor .. " " .. util.sh_quote(notes_path)
+        os.execute(cmd)
         
     else
         local model_query = subcommand
-        local matches, match_type = resolve.find_matching_models(cfg, model_query)
+        local model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model to view notes (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
         
-        if #matches == 0 then
-            print("No model found matching: " .. model_query)
-            os.exit(1)
-        elseif #matches == 1 then
-            local content = read_notes(matches[1])
-            if content then
-                print(content)
-            else
-                print("No notes yet for " .. matches[1] .. ".")
-                print("Notes file: " .. get_notes_path(matches[1]))
-            end
+        local content = read_notes(model_name)
+        if content then
+            print(content)
         else
-            local match_models = {}
-            for _, name in ipairs(matches) do
-                table.insert(match_models, {name = name})
-            end
-            local selected = picker.show_picker(match_models, cfg, "Select a model to view notes (↑/↓ arrows, Enter to confirm, q to quit):")
-            if selected then
-                local content = read_notes(selected)
-                if content then
-                    print(content)
-                else
-                    print("No notes yet for " .. selected .. ".")
-                    print("Notes file: " .. get_notes_path(selected))
-                end
-            end
+            print("No notes yet for " .. model_name .. ".")
+            print("Notes file: " .. get_notes_path(model_name))
         end
     end
 end

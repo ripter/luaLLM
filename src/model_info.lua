@@ -575,49 +575,11 @@ function M.handle_info_command(args, cfg)
         model_name = selected
         io.write("\27[2J\27[H")
     else
-        -- Model query provided - use fuzzy matching
-        local resolve = require("resolve")
-        local format = require("format")
-        local matches, match_type = resolve.find_matching_models(cfg, model_query)
-        
-        if #matches == 0 then
-            -- No matches
-            print("No model found matching: " .. model_query)
-            print()
-            print("Available models:")
-            local all_models = M.list_models(cfg.models_dir)
-            local suggestions = {}
-            for i = 1, math.min(10, #all_models) do
-                local _, size_str, quant, last_run_str = format.get_model_row(cfg, all_models[i].name)
-                table.insert(suggestions, {
-                    name = all_models[i].name,
-                    size_str = size_str,
-                    quant = quant,
-                    last_run_str = last_run_str
-                })
-            end
-            local max_name, max_size, max_quant = format.calculate_column_widths(suggestions)
-            for _, m in ipairs(suggestions) do
-                print("  " .. format.format_model_row(m, max_name, max_size, max_quant))
-            end
-            os.exit(1)
-        elseif #matches == 1 then
-            -- Exact match, use it
-            model_name = matches[1]
-        else
-            -- Multiple matches, show picker
-            print("Multiple models match '" .. model_query .. "':\n")
-            local match_models = {}
-            for _, name in ipairs(matches) do
-                table.insert(match_models, {name = name})
-            end
-            local selected = picker.show_picker(match_models, cfg, "Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):")
-            if selected then
-                model_name = selected
-            else
-                os.exit(0)
-            end
-        end
+        -- Model query provided - use resolver
+        local resolver = require("resolver")
+        model_name = resolver.resolve_or_exit(cfg, model_query, {
+            title = "Select a model to view info (↑/↓ arrows, Enter to confirm, q to quit):"
+        })
     end
     
     local info, status = M.load_model_info(model_name)

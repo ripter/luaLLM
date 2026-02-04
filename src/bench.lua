@@ -4,7 +4,7 @@
 local lfs = require("lfs")
 local util = require("util")
 local config = require("config")
-local resolve = require("resolve")
+local resolver = require("resolver")
 
 local M = {}
 
@@ -280,20 +280,10 @@ function M.handle_bench_command(args, cfg)
     end
     
     -- Resolve model
-    local matches, match_type = resolve.find_matching_models(cfg, model_query)
+    local model_name = resolver.resolve_or_exit(cfg, model_query, {
+        title = "Select a model to benchmark (↑/↓ arrows, Enter to confirm, q to quit):"
+    })
     
-    if #matches == 0 then
-        print("No model found matching: " .. model_query)
-        os.exit(1)
-    elseif #matches > 1 then
-        print("Multiple models match '" .. model_query .. "'. Please be more specific.")
-        for _, name in ipairs(matches) do
-            print("  " .. name)
-        end
-        os.exit(1)
-    end
-    
-    local model_name = matches[1]
     local model_path = util.expand_path(cfg.models_dir) .. "/" .. model_name .. ".gguf"
     
     if not util.file_exists(model_path) then

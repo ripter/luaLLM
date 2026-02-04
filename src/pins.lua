@@ -1,7 +1,7 @@
 local util = require("util")
 local config = require("config")
 local format = require("format")
-local resolve = require("resolve")
+local resolver = require("resolver")
 
 local M = {}
 
@@ -74,55 +74,34 @@ function M.handle_pin_command(args, cfg)
     end
     
     local model_query = args[2]
-    local matches, match_type = resolve.find_matching_models(cfg, model_query)
-    
-    if #matches == 0 then
-        print("No model found matching: " .. model_query)
-        print()
-        print("Available models:")
-        local model_info = require("model_info")
-        local all_models = model_info.list_models(cfg.models_dir)
-        local suggestions = {}
-        for i = 1, math.min(10, #all_models) do
-            local _, size_str, quant, last_run_str = format.get_model_row(cfg, all_models[i].name)
-            table.insert(suggestions, {
-                name = all_models[i].name,
-                size_str = size_str,
-                quant = quant,
-                last_run_str = last_run_str
-            })
-        end
-        local max_name, max_size, max_quant = format.calculate_column_widths(suggestions)
-        for _, m in ipairs(suggestions) do
-            print("  " .. format.format_model_row(m, max_name, max_size, max_quant))
-        end
-        os.exit(1)
-    elseif #matches == 1 then
-        local model_name = matches[1]
-        if M.add_pin(model_name) then
-            print("Pinned: " .. model_name)
-        else
-            print("Already pinned: " .. model_name)
-        end
-    else
-        -- Lazy load picker to avoid circular dependency
-        if not picker then
-            picker = require("picker")
-        end
-        
-        print("Multiple models match '" .. model_query .. "':\n")
-        local match_models = {}
-        for _, name in ipairs(matches) do
-            table.insert(match_models, {name = name})
-        end
-        local selected = picker.show_picker(match_models, cfg, "Select a model to pin (↑/↓ arrows, Enter to confirm, q to quit):")
-        if selected then
-            if M.add_pin(selected) then
-                print("Pinned: " .. selected)
-            else
-                print("Already pinned: " .. selected)
+    local model_name = resolver.resolve_or_exit(cfg, model_query, {
+        title = "Select a model to pin (↑/↓ arrows, Enter to confirm, q to quit):",
+        on_no_match = function(query)
+            print()
+            print("Available models:")
+            local model_info = require("model_info")
+            local all_models = model_info.list_models(cfg.models_dir)
+            local suggestions = {}
+            for i = 1, math.min(10, #all_models) do
+                local _, size_str, quant, last_run_str = format.get_model_row(cfg, all_models[i].name)
+                table.insert(suggestions, {
+                    name = all_models[i].name,
+                    size_str = size_str,
+                    quant = quant,
+                    last_run_str = last_run_str
+                })
+            end
+            local max_name, max_size, max_quant = format.calculate_column_widths(suggestions)
+            for _, m in ipairs(suggestions) do
+                print("  " .. format.format_model_row(m, max_name, max_size, max_quant))
             end
         end
+    })
+    
+    if M.add_pin(model_name) then
+        print("Pinned: " .. model_name)
+    else
+        print("Already pinned: " .. model_name)
     end
 end
 
@@ -134,37 +113,14 @@ function M.handle_unpin_command(args, cfg)
     end
     
     local model_query = args[2]
-    local matches, match_type = resolve.find_matching_models(cfg, model_query)
+    local model_name = resolver.resolve_or_exit(cfg, model_query, {
+        title = "Select a model to unpin (↑/↓ arrows, Enter to confirm, q to quit):"
+    })
     
-    if #matches == 0 then
-        print("No model found matching: " .. model_query)
-        os.exit(1)
-    elseif #matches == 1 then
-        local model_name = matches[1]
-        if M.remove_pin(model_name) then
-            print("Unpinned: " .. model_name)
-        else
-            print("Not pinned: " .. model_name)
-        end
+    if M.remove_pin(model_name) then
+        print("Unpinned: " .. model_name)
     else
-        -- Lazy load picker to avoid circular dependency
-        if not picker then
-            picker = require("picker")
-        end
-        
-        print("Multiple models match '" .. model_query .. "':\n")
-        local match_models = {}
-        for _, name in ipairs(matches) do
-            table.insert(match_models, {name = name})
-        end
-        local selected = picker.show_picker(match_models, cfg, "Select a model to unpin (↑/↓ arrows, Enter to confirm, q to quit):")
-        if selected then
-            if M.remove_pin(selected) then
-                print("Unpinned: " .. selected)
-            else
-                print("Not pinned: " .. selected)
-            end
-        end
+        print("Not pinned: " .. model_name)
     end
 end
 
