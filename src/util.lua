@@ -177,4 +177,49 @@ function M.format_size(bytes)
     end
 end
 
+-- Resolve llama-bench path from config
+function M.resolve_bench_path(cfg)
+    -- Priority 1: Explicit config path
+    if cfg.llama_bench_path then
+        local path = M.expand_path(cfg.llama_bench_path)
+        if M.file_exists(path) then
+            return path
+        end
+    end
+    
+    -- Priority 2: Derive from llama_cli_path directory
+    if cfg.llama_cli_path then
+        local cli_path = M.expand_path(cfg.llama_cli_path)
+        local bench_path = cli_path:gsub("llama%-cli$", "llama-bench")
+        if bench_path ~= cli_path and M.file_exists(bench_path) then
+            return bench_path
+        end
+    end
+    
+    -- Priority 3: Derive from llama_cpp_path directory
+    if cfg.llama_cpp_path then
+        local server_path = M.expand_path(cfg.llama_cpp_path)
+        local bench_path = server_path:gsub("llama%-server$", "llama-bench")
+        if bench_path ~= server_path and M.file_exists(bench_path) then
+            return bench_path
+        end
+    end
+    
+    -- Priority 4: Derive from source directory
+    if cfg.llama_cpp_source_dir then
+        local src_dir = M.expand_path(cfg.llama_cpp_source_dir)
+        local candidates = {
+            src_dir .. "/build/bin/llama-bench",
+            src_dir .. "/build/llama-bench",
+        }
+        for _, path in ipairs(candidates) do
+            if M.file_exists(path) then
+                return path
+            end
+        end
+    end
+    
+    return nil
+end
+
 return M

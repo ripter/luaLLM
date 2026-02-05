@@ -43,6 +43,7 @@ local resolver = require("resolver")
 local model_info = require("model_info")
 local notes = require("notes")
 local bench = require("bench")
+local doctor = require("doctor")
 
 -- Main command dispatcher
 local function main(args)
@@ -89,7 +90,7 @@ local function main(args)
         bench.handle_bench_command(args, cfg)
         
     elseif args[1] == "doctor" then
-        handle_doctor_command(cfg)
+        doctor.run(cfg)
         
     elseif args[1] == "help" or args[1] == "--help" or args[1] == "-h" then
         print_help()
@@ -103,60 +104,6 @@ local function main(args)
         
         local model_name = resolver.resolve_or_exit(cfg, model_query)
         model_info.run_model(cfg, model_name, extra_args)
-    end
-end
-
-function handle_doctor_command(cfg)
-    print("luaLLM diagnostics")
-    print()
-    print("Lua version: " .. _VERSION)
-    
-    local has_cjson = pcall(require, "cjson")
-    local has_lfs = pcall(require, "lfs")
-    print("lua-cjson: " .. (has_cjson and "✓ installed" or "✗ missing"))
-    print("luafilesystem: " .. (has_lfs and "✓ installed" or "✗ missing"))
-    print()
-    
-    print("Config file: " .. config.CONFIG_FILE)
-    if util.file_exists(config.CONFIG_FILE) then
-        print("  ✓ exists")
-        local loaded_cfg, err = util.load_json(config.CONFIG_FILE)
-        if err then
-            print("  ✗ " .. err)
-        else
-            print("  ✓ valid JSON")
-            
-            if loaded_cfg.llama_cpp_path then
-                local llama_path = util.expand_path(loaded_cfg.llama_cpp_path)
-                if util.file_exists(llama_path) then
-                    print("  ✓ llama.cpp binary exists: " .. llama_path)
-                else
-                    print("  ✗ llama.cpp binary not found: " .. llama_path)
-                end
-            end
-            
-            if loaded_cfg.models_dir then
-                local models_dir = util.expand_path(loaded_cfg.models_dir)
-                if util.is_dir(models_dir) then
-                    local models = model_info.list_models(loaded_cfg.models_dir)
-                    print("  ✓ models directory exists: " .. models_dir)
-                    print("    Found " .. #models .. " model(s)")
-                else
-                    print("  ✗ models directory not found: " .. models_dir)
-                end
-            end
-        end
-    else
-        print("  ✗ not found")
-    end
-    print()
-    
-    print("History file: " .. history.HISTORY_FILE)
-    if util.file_exists(history.HISTORY_FILE) then
-        local hist = history.load_history()
-        print("  ✓ exists (" .. #hist .. " entries)")
-    else
-        print("  - not yet created")
     end
 end
 

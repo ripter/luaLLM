@@ -17,50 +17,6 @@ M.BENCH_DIR = config.CONFIG_DIR .. "/bench"
 -- Path resolution
 -- ---------------------------------------------------------------------------
 
-local function resolve_bench_path(cfg)
-    -- Priority 1: Explicit config path
-    if cfg.llama_bench_path then
-        local path = util.expand_path(cfg.llama_bench_path)
-        if util.file_exists(path) then
-            return path
-        end
-    end
-    
-    -- Priority 2: Derive from llama_cli_path directory
-    if cfg.llama_cli_path then
-        local cli_path = util.expand_path(cfg.llama_cli_path)
-        local bench_path = cli_path:gsub("llama%-cli$", "llama-bench")
-        if bench_path ~= cli_path and util.file_exists(bench_path) then
-            return bench_path
-        end
-    end
-    
-    -- Priority 3: Derive from llama_cpp_path directory
-    if cfg.llama_cpp_path then
-        local server_path = util.expand_path(cfg.llama_cpp_path)
-        local bench_path = server_path:gsub("llama%-server$", "llama-bench")
-        if bench_path ~= server_path and util.file_exists(bench_path) then
-            return bench_path
-        end
-    end
-    
-    -- Priority 4: Derive from source directory
-    if cfg.llama_cpp_source_dir then
-        local src_dir = util.expand_path(cfg.llama_cpp_source_dir)
-        local candidates = {
-            src_dir .. "/build/bin/llama-bench",
-            src_dir .. "/build/llama-bench",
-        }
-        for _, path in ipairs(candidates) do
-            if util.file_exists(path) then
-                return path
-            end
-        end
-    end
-    
-    return nil
-end
-
 -- ---------------------------------------------------------------------------
 -- Helpers
 -- ---------------------------------------------------------------------------
@@ -596,9 +552,26 @@ function M.handle_bench_command(args, cfg)
     
     -- Parse flags
     local bench_cfg = cfg.bench or {}
-    local n_repeats = bench_cfg.default_n or 5
-    local warmup_runs = bench_cfg.default_warmup or 1
-    local threads = bench_cfg.default_threads or 8
+    local n_repeats = bench_cfg.default_n
+    local warmup_runs = bench_cfg.default_warmup
+    local threads = bench_cfg.default_threads
+    
+    -- Validate required config
+    if not n_repeats then
+        print("Error: bench.default_n not configured")
+        print("Run: luallm doctor")
+        os.exit(1)
+    end
+    if not warmup_runs then
+        print("Error: bench.default_warmup not configured")
+        print("Run: luallm doctor")
+        os.exit(1)
+    end
+    if not threads then
+        print("Error: bench.default_threads not configured")
+        print("Run: luallm doctor")
+        os.exit(1)
+    end
     
     local i = 3
     while i <= #args do
@@ -654,7 +627,7 @@ function M.handle_bench_command(args, cfg)
     end
     
     -- Resolve llama-bench path
-    local bench_path = resolve_bench_path(cfg)
+    local bench_path = util.resolve_bench_path(cfg)
     if not bench_path then
         print("Error: llama-bench not found")
         print()
