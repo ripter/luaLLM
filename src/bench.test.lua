@@ -381,5 +381,152 @@ more logs
         if cfg_fp1 == cfg_fp4 then
             error("different n should produce different config fingerprint", 2)
         end
+        
+        -- ── Test preamble extraction ───────────────────────────────────
+        local sample_output = [[
+llama-bench: loading model
+Metal: Apple M1 Max
+offloaded 33/33 layers to GPU
+[
+  {"n_prompt": 512, "n_gen": 0, "avg_ts": 100.0}
+]
+]]
+        
+        local preamble, json_str = bench._extract_preamble_and_json_for_test(sample_output)
+        
+        T.assert_contains(preamble, "Metal:", "preamble contains Metal")
+        T.assert_contains(preamble, "offloaded", "preamble contains offload info")
+        T.assert_contains(json_str, '"n_prompt"', "JSON string contains expected content")
+        
+        -- ── Test runtime signal extraction ─────────────────────────────
+        local signals = bench._extract_runtime_signals_for_test(preamble)
+        
+        T.assert_eq(signals.backend_hint, "metal", "detected Metal backend")
+        T.assert_eq(type(signals.gpu_name), "string", "extracted GPU name")
+        T.assert_contains(signals.gpu_name, "M1", "GPU name contains M1")
+        T.assert_eq(type(signals.offload), "table", "offload info is table")
+        T.assert_eq(signals.offload.offloaded, 33, "offloaded count correct")
+        T.assert_eq(signals.offload.total, 33, "total count correct")
+        
+        -- Test CUDA detection
+        local cuda_preamble = "CUDA: NVIDIA RTX 4090\noffloaded 40/40 layers"
+        local cuda_signals = bench._extract_runtime_signals_for_test(cuda_preamble)
+        T.assert_eq(cuda_signals.backend_hint, "cuda", "detected CUDA backend")
+        
+        -- Test CPU detection
+        local cpu_preamble = "CPU: running on BLAS"
+        local cpu_signals = bench._extract_runtime_signals_for_test(cpu_preamble)
+        T.assert_eq(cpu_signals.backend_hint, "cpu", "detected CPU backend")
+        
+        -- ── Test ID extraction ─────────────────────────────────────────
+        local results_array = {
+            {n_prompt = 512, n_gen = 0, avg_ts = 100},
+            {n_prompt = 1024, n_gen = 0, avg_ts = 200},
+            {n_prompt = 0, n_gen = 128, avg_ts = 50},
+            {n_prompt = 0, n_gen = 256, avg_ts = 60}
+        }
+        
+        local test_ids = bench._extract_test_ids_for_test(results_array)
+        
+        T.assert_eq(type(test_ids), "table", "test_ids is table")
+        T.assert_eq(#test_ids.pp, 2, "found 2 PP tests")
+        T.assert_eq(#test_ids.tg, 2, "found 2 TG tests")
+        T.assert_eq(test_ids.pp[1], "pp512", "first PP test is pp512")
+        T.assert_eq(test_ids.pp[2], "pp1024", "second PP test is pp1024")
+        T.assert_eq(test_ids.tg[1], "tg128", "first TG test is tg128")
+        T.assert_eq(test_ids.tg[2], "tg256", "second TG test is tg256")
+        
+        -- Test with explicit test names
+        local named_results = {
+            {test = "custom_pp", n_prompt = 512, n_gen = 0, avg_ts = 100},
+            {test = "custom_tg", n_prompt = 0, n_gen = 128, avg_ts = 50}
+        }
+        
+        local named_test_ids = bench._extract_test_ids_for_test(named_results)
+        T.assert_eq(named_test_ids.pp[1], "custom_pp", "uses explicit test name for PP")
+        T.assert_eq(named_test_ids.tg[1], "custom_tg", "uses explicit test name for TG")
+        
+        -- ── Test format_speed_ratio ────────────────────────────────────
+        T.assert_eq(bench._format_speed_ratio_for_test(100, 50), "2.00×", "2x faster")
+        T.assert_eq(bench._format_speed_ratio_for_test(50, 100), "0.50×", "0.5x (slower)")
+        T.assert_eq(bench._format_speed_ratio_for_test(100, 99), "≈same speed", "within 2% is same")
+        T.assert_eq(bench._format_speed_ratio_for_test(100, 101), "≈same speed", "within 2% is same (other direction)")
+        T.assert_eq(bench._format_speed_ratio_for_test(543.21, 100.5), "5.41×", "5.41x faster")
+        
+        -- ── Test compute_winner ─────────────────────────────────────────
+        local stats_a = {pp = {avg = 100}, tg = {avg = 50}}
+        local stats_b = {pp = {avg = 50}, tg = {avg = 25}}
+        local winner = bench._compute_winner_for_test(stats_a, stats_b, "ModelA", "ModelB")
+        
+        T.assert_eq(winner.pp_winner, "ModelA", "ModelA wins PP")
+        T.assert_eq(winner.pp_formatted, "2.00×", "PP ratio correct")
+        T.assert_eq(winner.tg_winner, "ModelA", "ModelA wins TG")
+        T.assert_eq(winner.tg_formatted, "2.00×", "TG ratio correct")
+        T.assert_eq(winner.overall_winner, "ModelA", "ModelA overall winner")
+        T.assert_eq(winner.is_mixed, false, "not mixed")
+        
+        -- Test mixed result
+        local stats_a_mixed = {pp = {avg = 100}, tg = {avg = 25}}
+        local stats_b_mixed = {pp = {avg = 50}, tg = {avg = 50}}
+        local winner_mixed = bench._compute_winner_for_test(stats_a_mixed, stats_b_mixed, "ModelA", "ModelB")
+        
+        T.assert_eq(winner_mixed.is_mixed, true, "mixed result detected")
+        T.assert_eq(winner_mixed.pp_winner, "ModelA", "ModelA wins PP in mixed")
+        T.assert_eq(winner_mixed.tg_winner, "ModelB", "ModelB wins TG in mixed")
+        
+        -- ── Test format_result_line ─────────────────────────────────────
+        local result_line = bench._format_result_line_for_test(winner, true, {})
+        T.assert_contains(result_line, "ModelA is faster overall", "contains winner")
+        T.assert_contains(result_line, "×", "contains × symbol")
+        T.assert_contains(result_line, "Prompt processing (PP)", "spells out PP")
+        T.assert_contains(result_line, "Token generation (TG)", "spells out TG")
+        T.assert_contains(result_line, "(Same benchmark config.)", "same config qualifier")
+        
+        -- Test with config differences
+        local result_line_diff = bench._format_result_line_for_test(winner, false, {"threads (8 vs 16)", "backend (metal vs cpu)"})
+        T.assert_contains(result_line_diff, "Configs differ", "contains config diff warning")
+        T.assert_contains(result_line_diff, "threads", "mentions threads diff")
+        T.assert_contains(result_line_diff, "treat with caution", "has caution warning")
+        
+        -- Test mixed result line
+        local result_line_mixed = bench._format_result_line_for_test(winner_mixed, true, {})
+        T.assert_contains(result_line_mixed, "Mixed results", "identifies mixed results")
+        T.assert_contains(result_line_mixed, "but", "contains 'but' for mixed")
+        
+        -- ── Test extract_env_summary ────────────────────────────────────
+        local mock_log = {
+            runtime_info = {
+                signals = {
+                    backend_hint = "metal",
+                    gpu_name = "Apple M3 Max"
+                },
+                build_info = {
+                    commit = "abc1234",
+                    number = 5678
+                }
+            },
+            tests = {
+                pp = {"pp512", "pp1024"},
+                tg = {"tg128"}
+            },
+            raw = {
+                runs = {{
+                    results_array = {{
+                        n_batch = 512,
+                        n_ubatch = 128,
+                        n_gpu_layers = 33
+                    }}
+                }}
+            }
+        }
+        
+        local env = bench._extract_env_summary_for_test(mock_log)
+        T.assert_eq(env.backend, "metal", "backend extracted")
+        T.assert_eq(env.gpu, "Apple M3 Max", "GPU extracted")
+        T.assert_contains(env.build, "abc1234", "build contains commit")
+        T.assert_contains(env.build, "5678", "build contains number")
+        T.assert_contains(env.tests, "pp512", "tests contain pp512")
+        T.assert_contains(env.knobs, "n_batch=512", "knobs contain n_batch")
+        T.assert_contains(env.knobs, "n_gpu_layers=33", "knobs contain n_gpu_layers")
     end
 }

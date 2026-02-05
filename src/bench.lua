@@ -94,6 +94,125 @@ local function list_models_with_bench_logs()
 end
 
 -- ---------------------------------------------------------------------------
+-- Runtime info extraction from preamble text
+-- ---------------------------------------------------------------------------
+
+-- Extract preamble (text before JSON) and JSON substring
+local function extract_preamble_and_json(output)
+    local obj_start = output:find("%{")
+    local arr_start = output:find("%[")
+    local json_start = nil
+    
+    if obj_start and arr_start then
+        json_start = math.min(obj_start, arr_start)
+    elseif obj_start then
+        json_start = obj_start
+    elseif arr_start then
+        json_start = arr_start
+    end
+    
+    if json_start and json_start > 1 then
+        local preamble = output:sub(1, json_start - 1)
+        local json_str = output:sub(json_start)
+        return preamble, json_str
+    else
+        return "", output
+    end
+end
+
+-- Extract runtime signals from preamble text (best-effort)
+local function extract_runtime_signals(preamble)
+    if not preamble or preamble == "" then
+        return {}
+    end
+    
+    local signals = {}
+    
+    -- Detect backend hints
+    if preamble:match("[Mm]etal") then
+        signals.backend_hint = "metal"
+    elseif preamble:match("CUDA") or preamble:match("cuda") then
+        signals.backend_hint = "cuda"
+    elseif preamble:match("[Vv]ulkan") then
+        signals.backend_hint = "vulkan"
+    elseif preamble:match("CPU") or preamble:match("BLAS") then
+        signals.backend_hint = "cpu"
+    end
+    
+    -- Extract GPU name if present
+    local gpu_line = preamble:match("Metal: ([^\n]+)") or
+                     preamble:match("CUDA: ([^\n]+)") or
+                     preamble:match("GPU[^:]*: ([^\n]+)")
+    if gpu_line then
+        signals.gpu_name = gpu_line:match("^%s*(.-)%s*$")  -- trim
+    end
+    
+    -- Look for offload information
+    local offload_match = preamble:match("offload[^%d]*(%d+)%s*/%s*(%d+)")
+    if offload_match then
+        local offloaded, total = preamble:match("offload[^%d]*(%d+)%s*/%s*(%d+)")
+        signals.offload = {
+            offloaded = tonumber(offloaded),
+            total = tonumber(total)
+        }
+    end
+    
+    -- Collect warning lines
+    local warnings = {}
+    for line in preamble:gmatch("[^\n]+") do
+        if line:match("[Ww]arning") or 
+           line:match("[Ff]ailed") or 
+           line:match("not enough") or
+           line:match("[Ff]allback") then
+            table.insert(warnings, line:match("^%s*(.-)%s*$"))  -- trim
+            if #warnings >= 5 then break end  -- cap at 5 warnings
+        end
+    end
+    if #warnings > 0 then
+        signals.warnings = warnings
+    end
+    
+    return signals
+end
+
+-- Extract test IDs from results array
+local function extract_test_ids(results_array)
+    local pp_tests = {}
+    local tg_tests = {}
+    local seen_pp = {}
+    local seen_tg = {}
+    
+    for _, result in ipairs(results_array) do
+        local test_name = result.test or result.name or result.id
+        
+        -- Check if this is a PP or TG test
+        local is_pp = result.n_prompt and result.n_prompt > 0 and (not result.n_gen or result.n_gen == 0)
+        local is_tg = result.n_gen and result.n_gen > 0
+        
+        if is_pp then
+            -- Use explicit name or infer from n_prompt
+            local id = test_name or string.format("pp%d", result.n_prompt)
+            if not seen_pp[id] then
+                table.insert(pp_tests, id)
+                seen_pp[id] = true
+            end
+        elseif is_tg then
+            -- Use explicit name or infer from n_gen
+            local id = test_name or string.format("tg%d", result.n_gen)
+            if not seen_tg[id] then
+                table.insert(tg_tests, id)
+                seen_tg[id] = true
+            end
+        end
+    end
+    
+    return {
+        pp = pp_tests,
+        tg = tg_tests
+    }
+end
+
+-- ---------------------------------------------------------------------------
 -- JSON parsing from llama-bench
 -- ---------------------------------------------------------------------------
 
@@ -181,7 +300,9 @@ local function parse_json_results(output)
         pp_values = pp_values,
         tg_values = tg_values,
         reported_threads = reported_threads,
-        build_info = build_info
+        build_info = build_info,
+        bench_json = data,           -- raw decoded JSON (top-level)
+        results_array = results_array  -- normalized results array
     }
 end
 
@@ -395,8 +516,11 @@ local function run_bench_with_json(bench_path, model_path, threads)
         return nil, output, err_msg
     end
     
+    -- Extract preamble (text before JSON) for runtime signals
+    local preamble, json_only = extract_preamble_and_json(output)
+    
     -- Try to parse JSON
-    local parsed, err = parse_json_results(output)
+    local parsed, err = parse_json_results(json_only)
     if not parsed then
         return nil, output, err
     end
@@ -405,11 +529,24 @@ local function run_bench_with_json(bench_path, model_path, threads)
     local pp_val = parsed.pp_values[1]
     local tg_val = parsed.tg_values[1]
     
+    -- Extract runtime signals from preamble
+    local signals = extract_runtime_signals(preamble)
+    
+    -- Cap preamble length for storage
+    local preamble_excerpt = preamble
+    if #preamble_excerpt > 4096 then
+        preamble_excerpt = preamble_excerpt:sub(1, 4096) .. "...[truncated]"
+    end
+    
     return {
         pp = pp_val,
         tg = tg_val,
         threads_reported = parsed.reported_threads,
-        build_info = parsed.build_info
+        build_info = parsed.build_info,
+        bench_json = parsed.bench_json,
+        results_array = parsed.results_array,
+        preamble_excerpt = preamble_excerpt,
+        signals = signals
     }, output, nil
 end
 
@@ -588,6 +725,9 @@ function M.handle_bench_command(args, cfg)
     local all_tg_values = {}
     local build_info = nil
     local reported_threads = nil
+    local raw_runs = {}  -- Store raw data from each run
+    local first_signals = nil  -- Runtime signals from first run
+    local first_preamble = nil
     
     for run = 1, n_repeats do
         io.write(string.format("  Run %d/%d... ", run, n_repeats))
@@ -616,10 +756,18 @@ function M.handle_bench_command(args, cfg)
             table.insert(all_tg_values, result.tg)
         end
         
-        -- Capture build info and threads from first run
+        -- Store raw data from this run
+        table.insert(raw_runs, {
+            bench_json = result.bench_json,
+            results_array = result.results_array
+        })
+        
+        -- Capture build info, threads, and runtime signals from first run
         if run == 1 then
             build_info = result.build_info
             reported_threads = result.threads_reported
+            first_signals = result.signals
+            first_preamble = result.preamble_excerpt
         end
         
         -- Print results for this run
@@ -628,6 +776,12 @@ function M.handle_bench_command(args, cfg)
             io.write(string.format(", TG=%.1f t/s", result.tg))
         end
         io.write("\n")
+    end
+    
+    -- Extract test IDs from first run's results
+    local test_ids = {}
+    if raw_runs[1] and raw_runs[1].results_array then
+        test_ids = extract_test_ids(raw_runs[1].results_array)
     end
     
     -- Compute aggregate stats
@@ -704,7 +858,21 @@ function M.handle_bench_command(args, cfg)
             pp_values = all_pp_values,
             tg_values = all_tg_values
         },
-        stats = stats
+        stats = stats,
+        tests = test_ids,  -- Test IDs (pp512, tg128, etc.)
+        runtime_info = {
+            preamble_excerpt = first_preamble,
+            signals = first_signals,
+            threads = {
+                requested = threads,
+                reported = reported_threads
+            },
+            build_info = build_info
+        },
+        raw = {
+            -- Store all runs if n is small, or just first representative run
+            runs = n_repeats <= 5 and raw_runs or {raw_runs[1]}
+        }
     }
     
     ensure_bench_dir()
@@ -827,18 +995,222 @@ function M.handle_bench_show(args, cfg)
 end
 
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- bench show command
+-- ---------------------------------------------------------------------------
+
+-- Format speed ratio as "X.XX×" or "≈same speed"
+local function format_speed_ratio(faster_avg, slower_avg)
+    if not faster_avg or not slower_avg or slower_avg == 0 then
+        return "N/A"
+    end
+    
+    local ratio = faster_avg / slower_avg
+    
+    -- Within 2% is "same speed"
+    if ratio >= 0.98 and ratio <= 1.02 then
+        return "≈same speed"
+    end
+    
+    return string.format("%.2f×", ratio)
+end
+
+-- Compute winner for comparison
+local function compute_winner(stats_a, stats_b, model_a, model_b)
+    local result = {
+        pp_winner = nil,
+        pp_ratio = nil,
+        pp_formatted = nil,
+        tg_winner = nil,
+        tg_ratio = nil,
+        tg_formatted = nil,
+        overall_winner = nil,
+        is_mixed = false
+    }
+    
+    -- PP comparison
+    if stats_a.pp and stats_b.pp then
+        local pp_a_avg = stats_a.pp.avg
+        local pp_b_avg = stats_b.pp.avg
+        
+        if pp_a_avg > pp_b_avg then
+            result.pp_winner = model_a
+            result.pp_loser = model_b
+            result.pp_ratio = pp_a_avg / pp_b_avg
+            result.pp_formatted = format_speed_ratio(pp_a_avg, pp_b_avg)
+        else
+            result.pp_winner = model_b
+            result.pp_loser = model_a
+            result.pp_ratio = pp_b_avg / pp_a_avg
+            result.pp_formatted = format_speed_ratio(pp_b_avg, pp_a_avg)
+        end
+    end
+    
+    -- TG comparison
+    if stats_a.tg and stats_b.tg then
+        local tg_a_avg = stats_a.tg.avg
+        local tg_b_avg = stats_b.tg.avg
+        
+        if tg_a_avg > tg_b_avg then
+            result.tg_winner = model_a
+            result.tg_loser = model_b
+            result.tg_ratio = tg_a_avg / tg_b_avg
+            result.tg_formatted = format_speed_ratio(tg_a_avg, tg_b_avg)
+        else
+            result.tg_winner = model_b
+            result.tg_loser = model_a
+            result.tg_ratio = tg_b_avg / tg_a_avg
+            result.tg_formatted = format_speed_ratio(tg_b_avg, tg_a_avg)
+        end
+    end
+    
+    -- Determine overall winner
+    if result.pp_winner and result.tg_winner then
+        if result.pp_winner == result.tg_winner then
+            result.overall_winner = result.pp_winner
+            result.is_mixed = false
+        else
+            result.is_mixed = true
+        end
+    elseif result.pp_winner then
+        result.overall_winner = result.pp_winner
+    elseif result.tg_winner then
+        result.overall_winner = result.tg_winner
+    end
+    
+    return result
+end
+
+-- Extract environment summary from bench log
+local function extract_env_summary(log)
+    local summary = {}
+    
+    -- Backend
+    local rt = log.runtime_info or {}
+    local signals = rt.signals or {}
+    summary.backend = signals.backend_hint or "(unavailable)"
+    
+    -- GPU
+    summary.gpu = signals.gpu_name or "(unavailable)"
+    
+    -- Build info
+    local build = rt.build_info or {}
+    if build.commit or build.number then
+        summary.build = string.format("%s (build %s)", 
+            build.commit or "?", 
+            tostring(build.number or "?"))
+    else
+        summary.build = "(unavailable)"
+    end
+    
+    -- Tests
+    local tests = log.tests or {}
+    local pp_tests = tests.pp or {}
+    local tg_tests = tests.tg or {}
+    if #pp_tests > 0 or #tg_tests > 0 then
+        local pp_str = #pp_tests > 0 and table.concat(pp_tests, ", ") or "none"
+        local tg_str = #tg_tests > 0 and table.concat(tg_tests, ", ") or "none"
+        summary.tests = string.format("prompt processing = %s, token generation = %s", pp_str, tg_str)
+    else
+        summary.tests = "(unavailable)"
+    end
+    
+    -- Extract knobs from first raw result if available
+    local raw = log.raw or {}
+    local runs = raw.runs or {}
+    if runs[1] and runs[1].results_array and runs[1].results_array[1] then
+        local first_result = runs[1].results_array[1]
+        local knobs = {}
+        
+        if first_result.n_batch then table.insert(knobs, "n_batch=" .. first_result.n_batch) end
+        if first_result.n_ubatch then table.insert(knobs, "n_ubatch=" .. first_result.n_ubatch) end
+        if first_result.n_gpu_layers then table.insert(knobs, "n_gpu_layers=" .. first_result.n_gpu_layers) end
+        if first_result.split_mode then table.insert(knobs, "split_mode=" .. first_result.split_mode) end
+        if first_result.devices then table.insert(knobs, "devices=" .. first_result.devices) end
+        
+        summary.knobs = #knobs > 0 and table.concat(knobs, ", ") or "(unavailable)"
+    else
+        summary.knobs = "(unavailable)"
+    end
+    
+    return summary
+end
+
+-- Format result line
+local function format_result_line(winner_info, config_comparable, config_diffs)
+    if not winner_info.pp_winner and not winner_info.tg_winner then
+        return "Result: No performance data available for comparison."
+    end
+    
+    local parts = {}
+    
+    if winner_info.is_mixed then
+        table.insert(parts, "Result: Mixed results.")
+        
+        if winner_info.pp_winner and winner_info.pp_formatted ~= "≈same speed" then
+            table.insert(parts, string.format("Prompt processing (PP): %s is %s faster than %s", 
+                winner_info.pp_winner, winner_info.pp_formatted, winner_info.pp_loser))
+        end
+        
+        if winner_info.tg_winner and winner_info.tg_formatted ~= "≈same speed" then
+            if #parts > 1 then
+                parts[#parts] = parts[#parts] .. ","
+            end
+            table.insert(parts, string.format("but token generation (TG): %s is %s faster than %s", 
+                winner_info.tg_winner, winner_info.tg_formatted, winner_info.tg_loser))
+        end
+    elseif winner_info.overall_winner then
+        table.insert(parts, string.format("Result: %s is faster overall.", winner_info.overall_winner))
+        
+        if winner_info.pp_winner and winner_info.pp_formatted ~= "≈same speed" then
+            table.insert(parts, string.format("Prompt processing (PP): %s faster than %s.", 
+                winner_info.pp_formatted, winner_info.pp_loser))
+        end
+        
+        if winner_info.tg_winner and winner_info.tg_formatted ~= "≈same speed" then
+            table.insert(parts, string.format("Token generation (TG): %s faster.", 
+                winner_info.tg_formatted))
+        end
+    end
+    
+    -- Add config comparability qualifier
+    if config_comparable then
+        table.insert(parts, "(Same benchmark config.)")
+    else
+        if config_diffs and #config_diffs > 0 then
+            -- Show top 3 diffs
+            local diff_str = table.concat(config_diffs, ", ", 1, math.min(3, #config_diffs))
+            table.insert(parts, string.format("(Configs differ: %s — treat with caution.)", diff_str))
+        else
+            table.insert(parts, "(Configs differ — treat with caution.)")
+        end
+    end
+    
+    return table.concat(parts, " ")
+end
+
+-- ---------------------------------------------------------------------------
 -- bench compare command
 -- ---------------------------------------------------------------------------
 
 function M.handle_bench_compare(args, cfg)
     if #args < 4 then
         print("Error: Missing model names")
-        print("Usage: luallm bench compare <modelA> <modelB>")
+        print("Usage: luallm bench compare <modelA> <modelB> [--verbose]")
         os.exit(1)
     end
     
     local model_a_query = args[3]
     local model_b_query = args[4]
+    
+    -- Check for --verbose flag
+    local verbose = false
+    for i = 5, #args do
+        if args[i] == "--verbose" or args[i] == "-v" then
+            verbose = true
+            break
+        end
+    end
     
     -- Resolve both models
     local model_a = resolver.resolve_or_exit(cfg, model_a_query, {
@@ -935,6 +1307,101 @@ function M.handle_bench_compare(args, cfg)
         end
     end
     
+    -- Check runtime info (backend/GPU) differences
+    local rt_a = log_a.runtime_info or {}
+    local rt_b = log_b.runtime_info or {}
+    local sig_a = rt_a.signals or {}
+    local sig_b = rt_b.signals or {}
+    
+    if sig_a.backend_hint and sig_b.backend_hint and sig_a.backend_hint ~= sig_b.backend_hint then
+        print("⚠ Backend mismatch detected:")
+        print(string.format("  A backend: %s, B backend: %s", sig_a.backend_hint, sig_b.backend_hint))
+        print("  (possible GPU offload mismatch - results may not be comparable)")
+        print()
+    end
+    
+    -- Check test ID differences
+    local tests_a = log_a.tests or {}
+    local tests_b = log_b.tests or {}
+    
+    local function lists_differ(list_a, list_b)
+        if #list_a ~= #list_b then return true end
+        for i = 1, #list_a do
+            if list_a[i] ~= list_b[i] then return true end
+        end
+        return false
+    end
+    
+    local pp_tests_differ = lists_differ(tests_a.pp or {}, tests_b.pp or {})
+    local tg_tests_differ = lists_differ(tests_a.tg or {}, tests_b.tg or {})
+    
+    if pp_tests_differ or tg_tests_differ then
+        print("⚠ Test suites differ:")
+        if pp_tests_differ then
+            print("  PP tests: A=[" .. table.concat(tests_a.pp or {}, ", ") .. "]")
+            print("           B=[" .. table.concat(tests_b.pp or {}, ", ") .. "]")
+        end
+        if tg_tests_differ then
+            print("  TG tests: A=[" .. table.concat(tests_a.tg or {}, ", ") .. "]")
+            print("           B=[" .. table.concat(tests_b.tg or {}, ", ") .. "]")
+        end
+        print("  (different test sets may affect comparability)")
+        print()
+    end
+    
+    -- Verbose environment summary (if requested)
+    if verbose then
+        print("Environment / Config Summary (verbose)")
+        print()
+        
+        local env_a = extract_env_summary(log_a)
+        local env_b = extract_env_summary(log_b)
+        
+        print("A (" .. model_a .. "):")
+        print("  • backend: " .. env_a.backend)
+        print("  • gpu: " .. env_a.gpu)
+        print("  • llama.cpp build: " .. env_a.build)
+        print("  • tests: " .. env_a.tests)
+        print("  • knobs: " .. env_a.knobs)
+        print()
+        
+        print("B (" .. model_b .. "):")
+        print("  • backend: " .. env_b.backend)
+        print("  • gpu: " .. env_b.gpu)
+        print("  • llama.cpp build: " .. env_b.build)
+        print("  • tests: " .. env_b.tests)
+        print("  • knobs: " .. env_b.knobs)
+        print()
+    end
+    
+    -- Build config diff summary for result line
+    local config_diffs = {}
+    if cfg_fp_a and cfg_fp_b and cfg_fp_a ~= cfg_fp_b then
+        local fpd_a = log_a.run_fingerprint_details or {}
+        local fpd_b = log_b.run_fingerprint_details or {}
+        local bc_a = log_a.bench_config or {}
+        local bc_b = log_b.bench_config or {}
+        
+        if bc_a.threads_requested ~= bc_b.threads_requested then
+            table.insert(config_diffs, string.format("threads (%s vs %s)", 
+                tostring(bc_a.threads_requested or "?"), 
+                tostring(bc_b.threads_requested or "?")))
+        end
+        
+        local sig_a = (log_a.runtime_info or {}).signals or {}
+        local sig_b = (log_b.runtime_info or {}).signals or {}
+        if sig_a.backend_hint and sig_b.backend_hint and sig_a.backend_hint ~= sig_b.backend_hint then
+            table.insert(config_diffs, string.format("backend (%s vs %s)", sig_a.backend_hint, sig_b.backend_hint))
+        end
+        
+        local build_a = fpd_a.build_commit or (fpd_a.build_info and fpd_a.build_info.commit)
+        local build_b = fpd_b.build_commit or (fpd_b.build_info and fpd_b.build_info.commit)
+        if build_a and build_b and build_a ~= build_b then
+            table.insert(config_diffs, string.format("build (%s vs %s)", 
+                build_a:sub(1, 7), build_b:sub(1, 7)))
+        end
+    end
+    
     -- Performance comparison
     print("Performance:")
     print()
@@ -952,12 +1419,18 @@ function M.handle_bench_compare(args, cfg)
         local n_b = results_b.pp_values and #results_b.pp_values or "?"
         local delta_abs = pp_b.avg - pp_a.avg
         local delta_pct = (delta_abs / pp_a.avg) * 100
+        local ratio = pp_b.avg / pp_a.avg
         
         print(string.format("  PP t/s (A n=%s, B n=%s):", tostring(n_a), tostring(n_b)))
         print(string.format("    A %.1f (%.1f–%.1f)  |  B %.1f (%.1f–%.1f)  |  Δ %+.1f (%+.1f%%)",
             pp_a.avg, pp_a.min, pp_a.max,
             pp_b.avg, pp_b.min, pp_b.max,
             delta_abs, delta_pct))
+        
+        -- Show ratio if delta is huge
+        if math.abs(delta_pct) >= 100 or ratio >= 2.0 or ratio <= 0.5 then
+            print(string.format("    (B is %.1f× A)", ratio))
+        end
     else
         print("  PP t/s:  N/A")
     end
@@ -970,17 +1443,29 @@ function M.handle_bench_compare(args, cfg)
         local n_b = results_b.tg_values and #results_b.tg_values or "?"
         local delta_abs = tg_b.avg - tg_a.avg
         local delta_pct = (delta_abs / tg_a.avg) * 100
+        local ratio = tg_b.avg / tg_a.avg
         
         print(string.format("  TG t/s (A n=%s, B n=%s):", tostring(n_a), tostring(n_b)))
         print(string.format("    A %.1f (%.1f–%.1f)  |  B %.1f (%.1f–%.1f)  |  Δ %+.1f (%+.1f%%)",
             tg_a.avg, tg_a.min, tg_a.max,
             tg_b.avg, tg_b.min, tg_b.max,
             delta_abs, delta_pct))
+        
+        -- Show ratio if delta is huge
+        if math.abs(delta_pct) >= 100 or ratio >= 2.0 or ratio <= 0.5 then
+            print(string.format("    (B is %.1f× A)", ratio))
+        end
     else
         print("  TG t/s:  N/A")
     end
     
     print()
+    
+    -- Compute and print result line
+    local winner_info = compute_winner(stats_a, stats_b, model_a, model_b)
+    local config_comparable = (cfg_fp_a and cfg_fp_b and cfg_fp_a == cfg_fp_b)
+    local result_line = format_result_line(winner_info, config_comparable, config_diffs)
+    print(result_line)
 end
 
 -- Expose parse functions and helpers for testing
@@ -990,5 +1475,12 @@ M._aggregate_samples_for_test = aggregate_samples
 M._fnv1a_32_for_test = fnv1a_32
 M._create_run_fingerprint_for_test = create_run_fingerprint
 M._create_config_fingerprint_for_test = create_config_fingerprint
+M._extract_preamble_and_json_for_test = extract_preamble_and_json
+M._extract_runtime_signals_for_test = extract_runtime_signals
+M._extract_test_ids_for_test = extract_test_ids
+M._format_speed_ratio_for_test = format_speed_ratio
+M._compute_winner_for_test = compute_winner
+M._extract_env_summary_for_test = extract_env_summary
+M._format_result_line_for_test = format_result_line
 
 return M
