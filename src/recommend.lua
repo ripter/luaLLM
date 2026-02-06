@@ -112,26 +112,38 @@ end
 
 -- Get default thread count from config
 local function get_default_threads(cfg, caps)
-    local threads = caps.cpu_threads
-    if cfg.bench and cfg.bench.default_threads then
-        threads = cfg.bench.default_threads
-    elseif cfg.default_threads then
-        threads = cfg.default_threads
+    -- Priority A: parse cfg.default_params for "-t N"
+    if cfg.default_params then
+        for _, param in ipairs(cfg.default_params) do
+            local threads = param:match("^%-t%s+(%d+)")
+            if threads then
+                return math.floor(tonumber(threads) + 0.5)
+            end
+        end
     end
-    return math.floor(threads + 0.5)
+    
+    -- Priority B: bench.default_threads
+    if cfg.bench and cfg.bench.default_threads then
+        local threads = cfg.bench.default_threads
+        return math.floor(threads + 0.5)
+    end
+    
+    -- Priority C: CPU threads
+    return math.floor(caps.cpu_threads + 0.5)
 end
 
 -- Generate candidate configurations for throughput optimization
 local function generate_throughput_candidates(cfg, model_name, caps)
     local candidates = {}
-    local base_ctx = 2048
+    local base_ctx = 2048  -- For benchmarking only
     
-    local default_threads = get_default_threads(cfg, caps)
+    local baseline_threads = get_default_threads(cfg, caps)
     
-    -- Thread candidates: {default, default-2, default+2} clamped to [1..cpu_threads]
+    -- Thread candidates: {baseline, baseline-2, baseline-4, baseline+2} clamped to [1..cpu_threads]
+    local thread_offsets = {0, -2, -4, 2}
     local thread_options = {}
-    for _, offset in ipairs({0, -2, 2}) do
-        local t = default_threads + offset
+    for _, offset in ipairs(thread_offsets) do
+        local t = baseline_threads + offset
         if t >= 1 and t <= caps.cpu_threads then
             local found = false
             for _, existing in ipairs(thread_options) do
@@ -144,6 +156,18 @@ local function generate_throughput_candidates(cfg, model_name, caps)
                 table.insert(thread_options, t)
             end
         end
+    end
+    
+    -- Ensure baseline is included
+    local baseline_found = false
+    for _, t in ipairs(thread_options) do
+        if t == baseline_threads then
+            baseline_found = true
+            break
+        end
+    end
+    if not baseline_found then
+        table.insert(thread_options, 1, baseline_threads)
     end
     
     -- Base flags (common to all candidates)
@@ -162,7 +186,8 @@ local function generate_throughput_candidates(cfg, model_name, caps)
             {k = "q8_0", v = "q8_0"},
             {k = "q4_0", v = "q4_0"}
         }
-        local flash_options = {"1", "0"}  -- 1=on, 0=off
+        -- Only test flash=on; flash=off is llama-bench default and may cause issues
+        local flash_options = {"1"}  -- Just test with flash enabled
         
         -- Generate all combinations
         for _, threads in ipairs(thread_options) do
@@ -181,7 +206,8 @@ local function generate_throughput_candidates(cfg, model_name, caps)
                     local flash_label = flash == "1" and "on" or "off"
                     table.insert(candidates, {
                         name = string.format("t=%d cache=%s flash=%s", threads, cache.k, flash_label),
-                        flags = flags
+                        flags = flags,
+                        flash_bench = flash  -- Keep bench value (0/1) for reference
                     })
                 end
             end
@@ -202,7 +228,16 @@ end
 
 -- Run bench for a single candidate (with flag overrides)
 local function bench_candidate(bench_path, model_path, extra_flags)
-    -- Build command with extra flags
+    -- Extract threads from flags
+    local threads = nil
+    for i, flag in ipairs(extra_flags) do
+        if flag == "-t" and extra_flags[i + 1] then
+            threads = math.floor(tonumber(extra_flags[i + 1]) + 0.5)
+            break
+        end
+    end
+    
+    -- Build command - pass through all flags
     local cmd_parts = {
         util.sh_quote(bench_path),
         "-m", util.sh_quote(model_path),
@@ -210,9 +245,39 @@ local function bench_candidate(bench_path, model_path, extra_flags)
         "-r", "1"  -- Single run
     }
     
-    -- Add extra flags
-    for _, flag in ipairs(extra_flags) do
-        table.insert(cmd_parts, flag)
+    -- Add all extra flags - use simple iteration to avoid double-adding values
+    local i = 1
+    while i <= #extra_flags do
+        local flag = extra_flags[i]
+        
+        if flag == "-t" or flag == "-b" or flag == "-ngl" then
+            -- Numeric flags - ensure integers
+            table.insert(cmd_parts, flag)
+            if extra_flags[i + 1] then
+                local value = tonumber(extra_flags[i + 1])
+                if value then
+                    table.insert(cmd_parts, tostring(math.floor(value + 0.5)))
+                else
+                    table.insert(cmd_parts, extra_flags[i + 1])
+                end
+                i = i + 2  -- Skip value
+            else
+                i = i + 1
+            end
+        elseif flag == "-ctk" or flag == "-ctv" or flag == "-fa" then
+            -- Flags with values - pass through as-is
+            table.insert(cmd_parts, flag)
+            if extra_flags[i + 1] then
+                table.insert(cmd_parts, extra_flags[i + 1])
+                i = i + 2  -- Skip value
+            else
+                i = i + 1
+            end
+        else
+            -- Standalone flag
+            table.insert(cmd_parts, flag)
+            i = i + 1
+        end
     end
     
     local cmd = table.concat(cmd_parts, " ") .. " 2>&1"
@@ -275,7 +340,7 @@ local function bench_candidate(bench_path, model_path, extra_flags)
         end
     end
     
-    return {pp = pp_val, tg = tg_val}, nil
+    return {pp = pp_val, tg = tg_val, threads = threads}, nil
 end
 
 -- Select best candidate based on TG (primary) and PP (tie-break)
@@ -332,6 +397,9 @@ local function recommend_throughput_sweep(cfg, model_name, caps)
     
     -- Run benchmarks
     local results = {}
+    local baseline_threads = get_default_threads(cfg, model_name, caps)
+    local baseline_result = nil
+    
     for i, candidate in ipairs(candidates) do
         io.write(string.format("  [%d/%d] %s... ", i, #candidates, candidate.name))
         io.flush()
@@ -348,6 +416,11 @@ local function recommend_throughput_sweep(cfg, model_name, caps)
         if result then
             results[i] = result
             print(string.format("PP=%.1f t/s, TG=%.1f t/s", result.pp or 0, result.tg or 0))
+            
+            -- Track baseline (candidate with baseline_threads)
+            if result.threads == baseline_threads then
+                baseline_result = result
+            end
         else
             results[i] = nil
             print("FAILED: " .. (err or "unknown error"))
@@ -408,6 +481,20 @@ local function recommend_throughput_sweep(cfg, model_name, caps)
     print(string.format("  PP: %.1f t/s", best_result.pp or 0))
     print(string.format("  TG: %.1f t/s", best_result.tg or 0))
     print()
+    
+    -- Check for improvement over baseline
+    if baseline_result and baseline_result.tg then
+        local improvement_ratio = best_result.tg / baseline_result.tg
+        print(string.format("Baseline (t=%d): TG=%.1f t/s", baseline_threads, baseline_result.tg))
+        print(string.format("Improvement: %.1f%%", (improvement_ratio - 1) * 100))
+        print()
+        
+        if improvement_ratio < 1.02 then
+            print("✗ No significant improvement found (< 2%)")
+            print("Keeping existing configuration")
+            return nil, "no improvement"
+        end
+    end
     
     -- Create preset
     -- Create preset with converted flags for llama-server
@@ -546,6 +633,12 @@ function M.handle_recommend_command(args, cfg)
     local preset, ctx_reason
     if profile == "throughput" then
         preset, ctx_reason = recommend_throughput(cfg, model_name, caps)
+        
+        -- Check if no improvement was found
+        if not preset and ctx_reason == "no improvement" then
+            print("No preset saved (keeping existing configuration)")
+            return
+        end
     elseif profile == "cold-start" then
         preset = recommend_cold_start(cfg, model_name, caps)
     elseif profile == "context" then
