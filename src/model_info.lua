@@ -317,7 +317,7 @@ local function find_matching_override(model_name, overrides)
     return nil
 end
 
-local function build_llama_command(config, model_name, extra_args)
+local function build_llama_command(config, model_name, extra_args, preset_flags)
     local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
     
     local argv = {util.expand_path(config.llama_cpp_path), "-m", model_path}
@@ -330,15 +330,25 @@ local function build_llama_command(config, model_name, extra_args)
         end
     end
     
+    -- Add default params
     if config.default_params then
         add_params(config.default_params)
     end
     
+    -- Add preset flags (if provided)
+    if preset_flags then
+        for _, flag in ipairs(preset_flags) do
+            table.insert(argv, flag)
+        end
+    end
+    
+    -- Add model-specific overrides
     local override = find_matching_override(model_name, config.model_overrides or {})
     if override then
         add_params(override)
     end
     
+    -- Add extra args (these override everything)
     if extra_args then
         for _, arg in ipairs(extra_args) do
             table.insert(argv, arg)
@@ -353,7 +363,7 @@ local function build_llama_command(config, model_name, extra_args)
     return table.concat(quoted_argv, " "), argv
 end
 
-function M.run_model(config, model_name, extra_args)
+function M.run_model(config, model_name, extra_args, preset_name)
     local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
     
     if not util.file_exists(model_path) then
@@ -366,7 +376,24 @@ function M.run_model(config, model_name, extra_args)
         os.exit(1)
     end
     
-    local cmd, argv = build_llama_command(config, model_name, extra_args)
+    -- Load preset if specified
+    local preset_flags = nil
+    if preset_name then
+        local recommend = require("recommend")
+        local preset = recommend.load_preset(config, model_name, preset_name)
+        
+        if not preset then
+            print("Error: No '" .. preset_name .. "' preset found for " .. model_name)
+            print("Run: luallm recommend " .. preset_name .. " " .. model_name)
+            os.exit(1)
+        end
+        
+        preset_flags = preset.flags
+        print("Using " .. preset_name .. " preset")
+        print()
+    end
+    
+    local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
     print("Starting llama.cpp with: " .. model_name)
     print("Command: " .. cmd)
     print()

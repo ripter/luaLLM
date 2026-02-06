@@ -44,6 +44,7 @@ local model_info = require("model_info")
 local notes = require("notes")
 local bench = require("bench")
 local doctor = require("doctor")
+local recommend = require("recommend")
 
 -- Main command dispatcher
 local function main(args)
@@ -92,6 +93,36 @@ local function main(args)
     elseif args[1] == "doctor" then
         doctor.run(cfg)
         
+    elseif args[1] == "recommend" then
+        recommend.handle_recommend_command(args, cfg)
+        
+    elseif args[1] == "run" then
+        -- New explicit run command with --preset support
+        if #args < 2 then
+            print("Error: Missing model name")
+            print("Usage: luallm run <model> [--preset <profile>] [...extra args]")
+            os.exit(1)
+        end
+        
+        local model_query = args[2]
+        local preset_name = nil
+        local extra_args = {}
+        
+        -- Parse args looking for --preset
+        local i = 3
+        while i <= #args do
+            if args[i] == "--preset" and args[i + 1] then
+                preset_name = args[i + 1]
+                i = i + 2
+            else
+                table.insert(extra_args, args[i])
+                i = i + 1
+            end
+        end
+        
+        local model_name = resolver.resolve_or_exit(cfg, model_query)
+        model_info.run_model(cfg, model_name, extra_args, preset_name)
+        
     elseif args[1] == "help" or args[1] == "--help" or args[1] == "-h" then
         print_help()
         
@@ -122,7 +153,14 @@ function print_help()
     print("  luallm bench <model> --threads T  Benchmark with T threads")
     print("  luallm bench show [model] View benchmark results")
     print("  luallm bench compare <A> <B>  Compare two model benchmarks")
+    print("  luallm bench compare <A> <B> --verbose  Compare with environment details")
     print("  luallm bench clear        Clear all benchmark logs")
+    print("  luallm recommend throughput [model]  Run benchmark sweep to find best throughput settings")
+    print("    (Generates candidates, benchmarks each, saves best TG t/s preset)")
+    print("  luallm recommend cold-start [model]  (not yet implemented)")
+    print("  luallm recommend context [model]  (not yet implemented)")
+    print("  luallm run <model> --preset <profile>  Run model with saved preset")
+    print("    CLI args after --preset override preset flags")
     print("  luallm pin <model>        Pin a model for quick access")
     print("  luallm unpin <model>      Unpin a model")
     print("  luallm pinned             List pinned models")
@@ -147,6 +185,10 @@ function print_help()
     print("  luallm bench mistral --n 10 --warmup 2  # 10 runs, 2 warmup")
     print("  luallm bench mistral --threads 16  # Benchmark with 16 threads")
     print("  luallm bench show                # Pick model to view results")
+    print("  luallm bench compare mistral qwen  # Compare two models")
+    print("  luallm recommend throughput llama-3  # Generate throughput preset")
+    print("  luallm run llama-3 --preset throughput  # Run with preset")
+    print("  luallm run llama-3 --preset throughput -c 4096  # Override context size")
     print("  luallm bench show TheDrummer     # View specific model results")
     print("  luallm bench compare Cydonia Maginum  # Compare two models")
     print("  luallm bench clear               # Clear benchmark logs")
