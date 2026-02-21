@@ -329,40 +329,10 @@ local function build_llama_command(config, model_name, extra_args, preset_flags)
             end
         end
     end
-
-    -- Build a set of flags already covered by the preset so we can skip
-    -- them from default_params and avoid passing the same flag twice.
-    -- Only flag names (tokens starting with "-") are tracked; their values
-    -- are not keys since they're positional and handled implicitly.
-    local preset_flag_set = {}
-    if preset_flags then
-        for _, token in ipairs(preset_flags) do
-            if token:sub(1, 1) == "-" then
-                preset_flag_set[token] = true
-            end
-        end
-    end
-
-    -- Add default params, skipping any flag that the preset overrides.
+    
+    -- Add default params
     if config.default_params then
-        for _, param in ipairs(config.default_params) do
-            -- Split param into tokens and walk them as flag/value pairs
-            local tokens = {}
-            for tok in param:gmatch("%S+") do
-                table.insert(tokens, tok)
-            end
-            local i = 1
-            while i <= #tokens do
-                local tok = tokens[i]
-                if tok:sub(1, 1) == "-" and preset_flag_set[tok] then
-                    -- This flag is covered by the preset; skip it and its value
-                    i = i + 2
-                else
-                    table.insert(argv, tok)
-                    i = i + 1
-                end
-            end
-        end
+        add_params(config.default_params)
     end
     
     -- Add preset flags (if provided)
@@ -423,6 +393,8 @@ function M.run_model(config, model_name, extra_args, preset_name)
         print()
     end
     
+    local state = require("state")
+
     local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
     print("Starting llama.cpp with: " .. model_name)
     print("Command: " .. cmd)
@@ -468,6 +440,8 @@ function M.run_model(config, model_name, extra_args, preset_name)
         if #captured_lines > 0 then
             save_model_info(config, model_name, captured_lines, run_config, end_reason, final_exit_code)
         end
+
+        state.mark_stopped(model_name, final_exit_code)
         
         local status = "exited"
         if opts.interrupted then
@@ -480,15 +454,24 @@ function M.run_model(config, model_name, extra_args, preset_name)
     end
     
     history.add_to_history(model_name, "running", nil)
-    
+    state.mark_running(model_name, run_config.port)
+
     local ok, err = xpcall(function()
         pipe = io.popen(cmd .. " 2>&1", "r")
         if not pipe then
             error("Failed to execute command")
         end
-        
+
+        local pid_updated = false
         for line in pipe:lines() do
             print(line)
+
+            -- After the server has had a few lines to bind its port,
+            -- attempt a one-shot PID discovery (non-blocking best-effort).
+            if not pid_updated and capture_count >= 3 then
+                state.try_update_pid(model_name, run_config.port)
+                pid_updated = true
+            end
             
             if capturing and should_capture_line(line) then
                 local sanitized_line = sanitize_large_arrays(line)

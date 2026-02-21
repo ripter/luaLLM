@@ -134,6 +134,30 @@ function M.save_json(filepath, data)
     f:close()
 end
 
+-- Write JSON atomically: write to a .tmp file then rename into place.
+-- Prevents readers from ever seeing a partial write.
+-- Returns true on success, or nil + error string on failure.
+function M.atomic_save_json(filepath, data)
+    local tmp = filepath .. ".tmp"
+    local f, err = io.open(tmp, "w")
+    if not f then
+        return nil, "cannot open tmp file: " .. tostring(err)
+    end
+    f:write(json.encode(data))
+    f:close()
+    local ok, rename_err = os.rename(tmp, filepath)
+    if not ok then
+        return nil, "rename failed: " .. tostring(rename_err)
+    end
+    return true
+end
+
+-- Format a Unix timestamp as an ISO 8601 UTC string, e.g. "2024-06-01T10:30:00Z".
+function M.iso8601(ts)
+    ts = ts or os.time()
+    return os.date("!%Y-%m-%dT%H:%M:%SZ", ts)
+end
+
 function M.format_time(timestamp)
     local now = os.time()
     local diff = now - timestamp
@@ -219,50 +243,6 @@ function M.resolve_bench_path(cfg)
         end
     end
     
-    return nil
-end
-
-function M.resolve_gguf_split_path(cfg)
-    -- Priority 1: Explicit config path
-    if cfg.llama_gguf_split_path then
-        local path = M.expand_path(cfg.llama_gguf_split_path)
-        if M.file_exists(path) then
-            return path
-        end
-    end
-
-    -- Priority 2: Derive from llama_cpp_path (llama-server → llama-gguf-split)
-    if cfg.llama_cpp_path then
-        local server_path = M.expand_path(cfg.llama_cpp_path)
-        local split_path = server_path:gsub("llama%-server$", "llama-gguf-split")
-        if split_path ~= server_path and M.file_exists(split_path) then
-            return split_path
-        end
-    end
-
-    -- Priority 3: Derive from llama_cli_path
-    if cfg.llama_cli_path then
-        local cli_path = M.expand_path(cfg.llama_cli_path)
-        local split_path = cli_path:gsub("llama%-cli$", "llama-gguf-split")
-        if split_path ~= cli_path and M.file_exists(split_path) then
-            return split_path
-        end
-    end
-
-    -- Priority 4: Derive from source directory
-    if cfg.llama_cpp_source_dir then
-        local src_dir = M.expand_path(cfg.llama_cpp_source_dir)
-        local candidates = {
-            src_dir .. "/build/bin/llama-gguf-split",
-            src_dir .. "/build/llama-gguf-split",
-        }
-        for _, path in ipairs(candidates) do
-            if M.file_exists(path) then
-                return path
-            end
-        end
-    end
-
     return nil
 end
 

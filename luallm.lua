@@ -45,7 +45,8 @@ local notes = require("notes")
 local bench = require("bench")
 local doctor = require("doctor")
 local recommend = require("recommend")
-local join = require("join")
+local join      = require("join")
+local state     = require("state")
 
 -- Main command dispatcher
 local function main(args)
@@ -99,6 +100,12 @@ local function main(args)
 
     elseif args[1] == "join" then
         join.handle_join_command(args, cfg)
+
+    elseif args[1] == "status" then
+        state.handle_status_command(args, cfg)
+
+    elseif args[1] == "stop" then
+        state.handle_stop_command(args, cfg)
 
     elseif args[1] == "run" then
         -- New explicit run command with --preset support
@@ -317,9 +324,41 @@ SUBCOMMAND_HELP["pin"] = function()
     print("  luallm pinned                   # List all pinned models")
 end
 
--- ---------------------------------------------------------------------------
--- Top-level help
--- ---------------------------------------------------------------------------
+SUBCOMMAND_HELP["stop"] = function()
+    print("luallm stop — Stop a running llama-server instance")
+    print()
+    print("USAGE:")
+    print("  luallm stop <model>")
+    print()
+    print("  Looks up the server in state.json, resolves its PID via lsof,")
+    print("  sends SIGTERM (then SIGKILL if needed), and marks it stopped.")
+    print("  Model name supports fuzzy matching.")
+    print()
+    print("EXAMPLES:")
+    print("  luallm stop mistral             # Stop the mistral server")
+    print("  luallm stop                     # (shows usage)")
+end
+
+SUBCOMMAND_HELP["status"] = function()
+    print("luallm status — Show running and recently stopped servers")
+    print()
+    print("USAGE:")
+    print("  luallm status")
+    print("  luallm status --json")
+    print()
+    print("  Reads ~/.cache/luallm/state.json and displays a summary.")
+    print("  State is written automatically whenever a model is started or stopped.")
+    print()
+    print("OPTIONS:")
+    print("  --json    Output the raw state.json as JSON (for scripting)")
+    print()
+    print("STATE FILE:  " .. require("state").STATE_FILE)
+    print()
+    print("EXAMPLES:")
+    print("  luallm status                   # Human-readable summary")
+    print("  luallm status --json            # Machine-readable JSON")
+    print("  cat ~/.cache/luallm/state.json  # Direct file access")
+end
 
 function print_help(subcommand)
     -- Subcommand detail page
@@ -345,6 +384,8 @@ function print_help(subcommand)
     print("  luallm                  Interactive picker (most-recent first)")
     print("  luallm <model>          Run a model  (fuzzy name match)")
     print("  luallm run <model>      Run with optional --preset flag")
+    print("  luallm stop <model>     Stop a running server")
+    print("  luallm status           Show running and recently stopped servers")
     print()
     print("MODEL MANAGEMENT:")
     print("  luallm list             List all models")
@@ -366,6 +407,8 @@ function print_help(subcommand)
     print()
     print("DETAILED HELP:")
     print("  luallm help run         Running models with presets and flags")
+    print("  luallm help stop        Stopping a running server")
+    print("  luallm help status      Checking server state (JSON output)")
     print("  luallm help bench       Benchmarking and comparing models")
     print("  luallm help recommend   Generating optimised presets")
     print("  luallm help notes       Attaching notes to models")
