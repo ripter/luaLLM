@@ -102,4 +102,67 @@ function M.capture_print(fn)
     return lines
 end
 
+-- Run *fn* (no arguments) and return a table of every string written via
+-- io.write() during its execution.  Each element is one write() call's
+-- argument converted to string.  io.write and io.flush are restored
+-- unconditionally afterward.
+--
+-- Note: io.flush is stubbed to a no-op so that code calling io.flush()
+-- after io.write() does not error.
+function M.capture_io_write(fn)
+    local chunks = {}
+    local old_write = io.write
+    local old_flush = io.flush
+
+    io.write = function(...)
+        for i = 1, select("#", ...) do
+            chunks[#chunks + 1] = tostring(select(i, ...))
+        end
+    end
+    io.flush = function() end
+
+    local ok, err = pcall(fn)
+    io.write = old_write           -- always restore
+    io.flush = old_flush
+
+    if not ok then error(err, 2) end
+    return chunks
+end
+
+-- Run *fn* and capture both print() and io.write() output.
+-- Returns two tables: (print_lines, io_write_chunks), using the same
+-- contracts as capture_print and capture_io_write respectively.
+-- Useful for modules that mix both output styles (e.g. progress bars).
+function M.capture_output(fn)
+    local print_lines   = {}
+    local write_chunks  = {}
+
+    local old_print = _G.print
+    local old_write = io.write
+    local old_flush = io.flush
+
+    _G.print = function(...)
+        local parts = {}
+        for i = 1, select("#", ...) do
+            parts[#parts + 1] = tostring(select(i, ...))
+        end
+        print_lines[#print_lines + 1] = table.concat(parts, "\t")
+    end
+
+    io.write = function(...)
+        for i = 1, select("#", ...) do
+            write_chunks[#write_chunks + 1] = tostring(select(i, ...))
+        end
+    end
+    io.flush = function() end
+
+    local ok, err = pcall(fn)
+    _G.print = old_print           -- always restore
+    io.write = old_write
+    io.flush = old_flush
+
+    if not ok then error(err, 2) end
+    return print_lines, write_chunks
+end
+
 return M

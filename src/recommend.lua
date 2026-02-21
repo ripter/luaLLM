@@ -397,7 +397,7 @@ local function recommend_throughput_sweep(cfg, model_name, caps)
     
     -- Run benchmarks
     local results = {}
-    local baseline_threads = get_default_threads(cfg, model_name, caps)
+    local baseline_threads = get_default_threads(cfg, caps)
     local baseline_result = nil
     
     for i, candidate in ipairs(candidates) do
@@ -570,9 +570,128 @@ local function recommend_throughput(cfg, model_name, caps)
     return recommend_throughput_sweep(cfg, model_name, caps)
 end
 
--- Generate cold-start preset (stub for now)
+-- Generate cold-start preset (static, derived from model properties)
+--
+-- Cold-start optimises for minimum time-to-first-token when the model is not
+-- already in memory.  llama-bench does not expose load time in its JSON output,
+-- so this profile is derived statically from model properties and system caps
+-- rather than via a benchmark sweep.
+--
+-- The main levers are:
+--   * Small context (-c): less KV cache to allocate at startup
+--   * Fewer GPU layers (-ngl on Metal): less VRAM to allocate and fewer Metal
+--     shaders to compile on first load; we use ~50% of layers as a heuristic
+--   * No flash attention: avoids additional Metal kernel compilation on load
+--   * Standard cache types (f16): no quantisation conversion at load time
+--   * Same thread count as throughput (load time is not thread-sensitive)
 local function recommend_cold_start(cfg, model_name, caps)
-    error("cold-start profile not yet implemented - coming soon!")
+    print("Analysing model for cold-start preset...")
+    print()
+
+    -- Load model info if available
+    local info = model_info.load_model_info(model_name)
+    local kv      = info and info.kv or {}
+    local derived = info and info.derived or {}
+
+    -- ── Context size ────────────────────────────────────────────────
+    -- Use a small fixed context to minimise KV cache allocation.
+    -- 512 is enough for most chat uses and cheap to allocate.
+    -- If the model's training context is smaller, clamp to that.
+    local cold_ctx = 512
+    local ctx_reason
+    if derived.ctx_train and derived.ctx_train < cold_ctx then
+        cold_ctx = derived.ctx_train
+        ctx_reason = string.format(
+            "clamped to training context (%d)", derived.ctx_train)
+    else
+        ctx_reason = string.format(
+            "fixed small context (%d) to minimise KV cache allocation", cold_ctx)
+    end
+
+    -- ── GPU layers (Metal only) ──────────────────────────────────────
+    -- Offloading all layers maximises throughput but requires allocating
+    -- all VRAM upfront and compiling every Metal shader on first load.
+    -- For cold-start we use ~50% of layers as a balance: inference remains
+    -- GPU-accelerated but startup cost is roughly halved.
+    local ngl_value = nil
+    local ngl_reason
+    if caps.has_metal then
+        local block_count = kv["llama.block_count"]
+        if block_count and type(block_count) == "number" then
+            ngl_value = math.floor(block_count * 0.5 + 0.5)
+            ngl_reason = string.format(
+                "~50%% of %d layers (%d) to reduce Metal shader compilation and VRAM allocation",
+                block_count, ngl_value)
+        else
+            -- No layer count available — use a conservative fixed value
+            ngl_value = 16
+            ngl_reason = "fixed 16 layers (layer count unavailable; run luallm info to populate)"
+        end
+    end
+
+    -- ── Thread count ────────────────────────────────────────────────
+    -- Load time is not meaningfully affected by thread count.
+    -- Use the default so inference after load is still performant.
+    local threads = get_default_threads(cfg, caps)
+
+    -- ── Assemble preset flags ────────────────────────────────────────
+    local preset_flags = {
+        "-t",  tostring(threads),
+        "-tb", tostring(threads),   -- batch threads = same as compute threads
+        "-c",  tostring(cold_ctx),
+    }
+
+    if caps.has_metal and ngl_value then
+        table.insert(preset_flags, "-ngl")
+        table.insert(preset_flags, tostring(ngl_value))
+        -- Explicitly disable flash attention to avoid shader compilation on load
+        table.insert(preset_flags, "--flash-attn")
+        table.insert(preset_flags, "off")
+        -- Use f16 cache types (no quantisation conversion overhead at load time)
+        table.insert(preset_flags, "--cache-type-k")
+        table.insert(preset_flags, "f16")
+        table.insert(preset_flags, "--cache-type-v")
+        table.insert(preset_flags, "f16")
+    end
+
+    -- ── Build notes ─────────────────────────────────────────────────
+    local notes_parts = {
+        "Optimised for fast cold-start (minimum time-to-first-token from cold memory).",
+        string.format("Context: %s.", ctx_reason),
+    }
+    if ngl_reason then
+        table.insert(notes_parts, string.format("GPU layers: %s.", ngl_reason))
+    end
+    if caps.has_metal then
+        table.insert(notes_parts,
+            "Flash attention disabled and f16 cache types used to avoid extra Metal kernel " ..
+            "compilation on first load.")
+    end
+    table.insert(notes_parts,
+        "Note: this preset trades peak throughput for faster startup. " ..
+        "For sustained performance use the throughput preset.")
+
+    local preset = {
+        created_at = os.time(),
+        source     = "recommend",
+        notes      = table.concat(notes_parts, " "),
+        flags      = preset_flags,
+    }
+
+    -- ── Print analysis ───────────────────────────────────────────────
+    if caps.has_metal and ngl_value then
+        print(string.format("  Context:     %d tokens (%s)", cold_ctx, ctx_reason))
+        print(string.format("  GPU layers:  %d (%s)", ngl_value, ngl_reason))
+        print("  Flash attn:  off (avoids Metal shader compilation)")
+        print("  Cache types: f16/f16 (no quantisation conversion overhead)")
+        print(string.format("  Threads:     %d", threads))
+    else
+        print(string.format("  Context:     %d tokens (%s)", cold_ctx, ctx_reason))
+        print(string.format("  Threads:     %d", threads))
+    end
+    print()
+
+    return preset
 end
 
 -- Generate context preset (stub for now)
@@ -690,6 +809,9 @@ function M.load_preset(cfg, model_name, profile)
 end
 
 -- Export for testing
-M._choose_context_for_test = choose_context_for_throughput
+M._choose_context_for_test         = choose_context_for_throughput
+M._get_default_threads_for_test    = get_default_threads
+M._generate_candidates_for_test    = generate_throughput_candidates
+M._select_best_candidate_for_test  = select_best_candidate
 
 return M

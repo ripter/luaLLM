@@ -329,10 +329,40 @@ local function build_llama_command(config, model_name, extra_args, preset_flags)
             end
         end
     end
-    
-    -- Add default params
+
+    -- Build a set of flags already covered by the preset so we can skip
+    -- them from default_params and avoid passing the same flag twice.
+    -- Only flag names (tokens starting with "-") are tracked; their values
+    -- are not keys since they're positional and handled implicitly.
+    local preset_flag_set = {}
+    if preset_flags then
+        for _, token in ipairs(preset_flags) do
+            if token:sub(1, 1) == "-" then
+                preset_flag_set[token] = true
+            end
+        end
+    end
+
+    -- Add default params, skipping any flag that the preset overrides.
     if config.default_params then
-        add_params(config.default_params)
+        for _, param in ipairs(config.default_params) do
+            -- Split param into tokens and walk them as flag/value pairs
+            local tokens = {}
+            for tok in param:gmatch("%S+") do
+                table.insert(tokens, tok)
+            end
+            local i = 1
+            while i <= #tokens do
+                local tok = tokens[i]
+                if tok:sub(1, 1) == "-" and preset_flag_set[tok] then
+                    -- This flag is covered by the preset; skip it and its value
+                    i = i + 2
+                else
+                    table.insert(argv, tok)
+                    i = i + 1
+                end
+            end
+        end
     end
     
     -- Add preset flags (if provided)

@@ -127,82 +127,219 @@ return { run = function()
     -- Restore original function
     model_info.load_model_info = original_load
     
-    -- ── Test thread variation in bench runner ──────────────────────
-    -- Mock bench runner that tracks which threads it receives
-    local thread_calls = {}
-    recommend._bench_runner = function(bench_path, model_path, flags)
-        -- Extract threads from flags
-        local threads = nil
-        for i, flag in ipairs(flags) do
-            if flag == "-t" and flags[i + 1] then
-                threads = tonumber(flags[i + 1])
-                break
+    -- ── Integration tests: full sweep via handle_recommend_command ──
+    --
+    -- These tests call handle_recommend_command, which internally calls
+    -- resolver.resolve_or_exit.  Without stubbing, that hits the real
+    -- filesystem and calls os.exit(1) when "fake-model" isn't found,
+    -- killing the entire test runner process.
+    --
+    -- We use T.with_stubs to install and safely restore all five modules
+    -- that touch disk or exit: util, resolver, model_info, config, bench.
+    -- recommend itself must be REMOVE'd so it re-requires against the stubs.
+
+    local SWEEP_CFG = { models_dir = "/fake/models", bench = { default_threads = 8 } }
+
+    local SWEEP_ARGS = {"recommend", "throughput", "fake-model"}
+
+    local function base_sweep_stubs(extra)
+        local stubs = {
+            util = {
+                file_exists         = function() return true end,
+                save_json           = function() end,
+                resolve_bench_path  = function() return "/fake/llama-bench" end,
+                expand_path         = function(p) return p end,
+                sh_quote            = function(s) return s end,
+                normalize_exit_code = function() return 0 end,
+            },
+            resolver = {
+                resolve_or_exit = function(cfg, query) return query end,
+            },
+            model_info = {
+                load_model_info = function() return nil end,
+                list_models     = function() return {} end,
+            },
+            config = { CONFIG_FILE = "/fake/config.json" },
+            bench  = {},
+            recommend = T.REMOVE,
+        }
+        if extra then
+            for k, v in pairs(extra) do stubs[k] = v end
+        end
+        return stubs
+    end
+
+    -- ── Test thread variation: multiple thread counts are tested ────
+    do
+        local thread_counts_seen = {}
+        local rec
+
+        T.with_stubs(base_sweep_stubs(), function()
+            rec = require("recommend")
+            rec._bench_runner = function(bench_path, model_path, flags)
+                local threads = nil
+                for i, flag in ipairs(flags) do
+                    if flag == "-t" and flags[i + 1] then
+                        threads = tonumber(flags[i + 1]); break
+                    end
+                end
+                local seen = false
+                for _, t in ipairs(thread_counts_seen) do
+                    if t == threads then seen = true; break end
+                end
+                if not seen then table.insert(thread_counts_seen, threads) end
+                local tg = threads == 8 and 80.0 or 50.0
+                return {pp = 100.0, tg = tg, threads = threads}, nil
+            end
+            T.capture_output(function()
+                rec.handle_recommend_command(SWEEP_ARGS, SWEEP_CFG)
+            end)
+        end)
+
+        if #thread_counts_seen < 2 then
+            error("expected multiple thread counts to be tested, got: " ..
+                  table.concat(thread_counts_seen, ", "), 2)
+        end
+    end
+
+    -- ── Test baseline improvement: no save when gain is < 2% ────────
+    do
+        local save_called = false
+        local rec
+
+        local stubs = base_sweep_stubs({
+            util = {
+                file_exists         = function() return true end,
+                save_json           = function() save_called = true end,
+                resolve_bench_path  = function() return "/fake/llama-bench" end,
+                expand_path         = function(p) return p end,
+                sh_quote            = function(s) return s end,
+                normalize_exit_code = function() return 0 end,
+            },
+        })
+        T.with_stubs(stubs, function()
+            rec = require("recommend")
+            rec._bench_runner = function(bench_path, model_path, flags)
+                local threads = nil
+                for i, flag in ipairs(flags) do
+                    if flag == "-t" and flags[i + 1] then
+                        threads = tonumber(flags[i + 1]); break
+                    end
+                end
+                return {pp = 100.0, tg = 50.0, threads = threads}, nil
+            end
+            T.capture_output(function()
+                rec.handle_recommend_command(SWEEP_ARGS, SWEEP_CFG)
+            end)
+        end)
+
+        T.assert_eq(save_called, false, "no preset saved when improvement is < 2%")
+    end
+
+    -- ── Test flash-attn: bench receives 0/1, saved preset uses on/off ──
+    -- Only fires on Metal (macOS); on non-Metal no -fa flags appear and
+    -- the checks are skipped gracefully.
+    do
+        local saved_cfg = nil
+        local fa_bench_values = {}
+        local rec
+
+        local stubs = base_sweep_stubs({
+            util = {
+                file_exists         = function() return true end,
+                save_json           = function(_, data) saved_cfg = data end,
+                resolve_bench_path  = function() return "/fake/llama-bench" end,
+                expand_path         = function(p) return p end,
+                sh_quote            = function(s) return s end,
+                normalize_exit_code = function() return 0 end,
+            },
+        })
+        T.with_stubs(stubs, function()
+            rec = require("recommend")
+            rec._bench_runner = function(bench_path, model_path, flags)
+                local threads = nil
+                for i, flag in ipairs(flags) do
+                    if flag == "-t" and flags[i + 1] then threads = tonumber(flags[i + 1]) end
+                    if flag == "-fa" and flags[i + 1] then
+                        table.insert(fa_bench_values, flags[i + 1])
+                    end
+                end
+                local tg = threads == 8 and 80.0 or 50.0
+                return {pp = 100.0, tg = tg, threads = threads}, nil
+            end
+            T.capture_output(function()
+                rec.handle_recommend_command(SWEEP_ARGS, SWEEP_CFG)
+            end)
+        end)
+
+        for _, val in ipairs(fa_bench_values) do
+            if val ~= "0" and val ~= "1" then
+                error("bench runner received non-numeric -fa value: " .. tostring(val), 2)
             end
         end
-        table.insert(thread_calls, threads)
-        
-        -- Return result with threads
-        return {
-            pp = 100.0,
-            tg = 50.0 + (threads or 0) * 0.5,  -- Slightly better with more threads
-            threads = threads
-        }, nil
-    end
-    
-    -- Note: Can't easily test full recommend without mocking more infrastructure,
-    -- but we've verified the bench runner receives threads parameter
-    
-    recommend._bench_runner = nil
-    
-    -- ── Test baseline improvement check ─────────────────────────────
-    -- Mock bench runner that returns predictable results
-    local baseline_improvement_test = {}
-    recommend._bench_runner = function(bench_path, model_path, flags)
-        local threads = nil
-        for i, flag in ipairs(flags) do
-            if flag == "-t" and flags[i + 1] then
-                threads = tonumber(flags[i + 1])
-                break
+
+        if saved_cfg then
+            local preset = saved_cfg.models and
+                           saved_cfg.models["fake-model"] and
+                           saved_cfg.models["fake-model"].presets and
+                           saved_cfg.models["fake-model"].presets.throughput
+            if preset and preset.flags then
+                local flags_str = table.concat(preset.flags, " ")
+                if flags_str:find("--flash%-attn") then
+                    if flags_str:find("--flash%-attn%s+[01]") then
+                        error("preset --flash-attn must use 'on'/'off', not '0'/'1': " .. flags_str, 2)
+                    end
+                    T.assert_contains(flags_str, "--flash-attn on",
+                        "preset uses 'on'/'off' for --flash-attn")
+                end
             end
         end
-        
-        -- Baseline (8 threads) = 100 TG
-        -- Other configs slightly worse
-        local tg = 98.0
-        if threads == 8 then
-            tg = 100.0  -- Baseline
-        end
-        
-        return {pp = 100.0, tg = tg, threads = threads}, nil
     end
-    
-    -- This would test that no preset is saved if improvement < 2%
-    -- (Can't easily test without full integration, but logic is in place)
-    
-    recommend._bench_runner = nil
-    
-    -- ── Test flash-attn uses 0/1 for bench, on/off for preset ──────
-    -- Verify that bench flags use "0" and "1", not "on" and "off"
-    local flash_bench_calls = {}
-    recommend._bench_runner = function(bench_path, model_path, flags)
-        -- Check for -fa flag
-        for i, flag in ipairs(flags) do
-            if flag == "-fa" and flags[i + 1] then
-                table.insert(flash_bench_calls, flags[i + 1])
+
+    -- ── Test TG is primary selection metric ─────────────────────────
+    -- t=6 has lower PP but much higher TG. It must win.
+    do
+        local saved_cfg = nil
+        local rec
+
+        local stubs = base_sweep_stubs({
+            util = {
+                file_exists         = function() return true end,
+                save_json           = function(_, data) saved_cfg = data end,
+                resolve_bench_path  = function() return "/fake/llama-bench" end,
+                expand_path         = function(p) return p end,
+                sh_quote            = function(s) return s end,
+                normalize_exit_code = function() return 0 end,
+            },
+        })
+        T.with_stubs(stubs, function()
+            rec = require("recommend")
+            rec._bench_runner = function(bench_path, model_path, flags)
+                local threads = nil
+                for i, flag in ipairs(flags) do
+                    if flag == "-t" and flags[i + 1] then
+                        threads = tonumber(flags[i + 1]); break
+                    end
+                end
+                if threads == 6 then
+                    return {pp = 80.0, tg = 120.0, threads = threads}, nil
+                else
+                    return {pp = 150.0, tg = 40.0, threads = threads}, nil
+                end
             end
-        end
-        return {pp = 100.0, tg = 50.0, threads = 8}, nil
+            T.capture_output(function()
+                rec.handle_recommend_command(SWEEP_ARGS, SWEEP_CFG)
+            end)
+        end)
+
+        T.assert_eq(type(saved_cfg), "table", "config was saved")
+        local preset = saved_cfg.models and
+                       saved_cfg.models["fake-model"] and
+                       saved_cfg.models["fake-model"].presets and
+                       saved_cfg.models["fake-model"].presets.throughput
+        T.assert_eq(type(preset), "table", "throughput preset was saved")
+        T.assert_contains(table.concat(preset.flags, " "), "-t 6",
+            "candidate with best TG (t=6) won despite lower PP")
     end
-    
-    -- This test verifies the bench runner receives "0" or "1", not "on" or "off"
-    -- (Can't fully test without running the full command, but the structure is verified)
-    
-    recommend._bench_runner = nil
-    
-    -- Verify flash values are numeric strings
-    for _, val in ipairs(flash_bench_calls) do
-        if val ~= "0" and val ~= "1" then
-            error("flash-attn bench value must be '0' or '1', got: " .. tostring(val), 2)
-        end
-    end
+
 end }
