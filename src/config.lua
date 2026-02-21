@@ -19,8 +19,9 @@ local function create_default_config()
         local default = {
             llama_cpp_path = "/usr/local/bin/llama-server",
             models_dir = os.getenv("HOME") .. "/models",
+            default_port = 8080,
             recent_models_count = 7,
-            default_params = {"-c 4096", "--port 8080", "--host 127.0.0.1"}
+            default_params = {"-c 4096", "--host 127.0.0.1"}
         }
         util.save_json(M.CONFIG_FILE, default)
     end

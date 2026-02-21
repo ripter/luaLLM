@@ -4,30 +4,37 @@
 -- external tools (e.g. luagent) can discover live servers without
 -- polling HTTP or guessing ports.
 --
--- Schema (version 1.0):
+-- TWO LAUNCH MODES:
+--
+--   Foreground (luallm run / luallm <model>):
+--     Uses io.popen, streams output to stdout.  PID discovered post-hoc
+--     via lsof (best-effort).
+--
+--   Daemon (luallm start <model>):
+--     Shell one-liner:  nohup <cmd> > logfile 2>&1 & echo $! > pidfile
+--     Returns immediately.  PID is exact (read straight from the pidfile).
+--     Log: ~/.cache/luallm/logs/<model>.log  (overwritten each launch).
+--
+-- Schema (state.json version 1.0):
 --   {
---     "version": "1.0",
---     "last_used": "mistral-7b.Q4_K_M",       -- most recently started model
+--     "version":   "1.0",
+--     "last_used": "mistral-7b.Q4_K_M",
 --     "servers": [
 --       {
---         "model":      "mistral-7b.Q4_K_M",   -- model name (no .gguf)
---         "port":       11434,                  -- integer, or null if unknown
---         "pid":        12345,                  -- integer, or null if unavailable
+--         "model":      "mistral-7b.Q4_K_M",
+--         "port":       11434,
+--         "pid":        12345,
+--         "mode":       "daemon" | "foreground",
+--         "log_file":   "/path/to/model.log",   -- daemon only
 --         "state":      "running" | "stopped",
---         "started_at": "2024-06-01T10:30:00Z", -- ISO 8601 UTC
---         "stopped_at": "2024-06-01T11:00:00Z"  -- ISO 8601 UTC, only when stopped
+--         "started_at": "2024-06-01T10:30:00Z",
+--         "stopped_at": "2024-06-01T11:00:00Z"
 --       }
 --     ]
 --   }
---
--- Notes on PID:
---   Standard Lua io.popen does not expose the child PID.  We attempt to
---   discover it by querying lsof/lsof (macOS/Linux) for the known port after
---   the server starts.  If discovery fails the field is written as json null.
 
-local util   = require("util")
-local config = require("config")
-local json   = require("cjson")
+local util = require("util")
+local json = require("cjson")
 
 local M = {}
 
@@ -37,11 +44,27 @@ local M = {}
 
 local CACHE_DIR = (os.getenv("XDG_CACHE_HOME") or
                    (os.getenv("HOME") .. "/.cache")) .. "/luallm"
+local LOGS_DIR  = CACHE_DIR .. "/logs"
+local PIDS_DIR  = CACHE_DIR .. "/pids"
 
 M.STATE_FILE = CACHE_DIR .. "/state.json"
 
-local function ensure_cache_dir()
+local function ensure_dirs()
     util.ensure_dir(CACHE_DIR)
+    util.ensure_dir(LOGS_DIR)
+    util.ensure_dir(PIDS_DIR)
+end
+
+local function safe_name(model_name)
+    return model_name:gsub("[^%w%-%._]", "_")
+end
+
+function M.log_file_for(model_name)
+    return LOGS_DIR .. "/" .. safe_name(model_name) .. ".log"
+end
+
+local function pid_file_for(model_name)
+    return PIDS_DIR .. "/" .. safe_name(model_name) .. ".pid"
 end
 
 -- ---------------------------------------------------------------------------
@@ -49,59 +72,57 @@ end
 -- ---------------------------------------------------------------------------
 
 local function load_state()
-    local data, err = util.load_json(M.STATE_FILE)
+    local data = util.load_json(M.STATE_FILE)
     if not data then
         return { version = "1.0", servers = {} }
     end
-    -- Ensure servers is always a table even if the file was hand-edited
-    if type(data.servers) ~= "table" then
-        data.servers = {}
-    end
+    if type(data.servers) ~= "table" then data.servers = {} end
     return data
 end
 
 local function save_state(data)
-    ensure_cache_dir()
+    ensure_dirs()
     local ok, err = util.atomic_save_json(M.STATE_FILE, data)
     if not ok then
-        -- Non-fatal: log to stderr and continue.  The server still runs;
-        -- state.json is a convenience file, not a hard requirement.
         io.stderr:write("luallm: warning: could not write state.json: " ..
                         tostring(err) .. "\n")
     end
 end
 
 -- ---------------------------------------------------------------------------
--- PID discovery
+-- PID helpers
 -- ---------------------------------------------------------------------------
 
--- Attempt to find the PID of the process listening on *port* using lsof.
--- Returns an integer PID, or nil if discovery fails or port is nil.
-local function discover_pid(port)
-    if not port then return nil end
+-- Read the PID written by `echo $! > pidfile` in the daemon launch shell cmd.
+local function read_pid_file(model_name)
+    local path = pid_file_for(model_name)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local line = f:read("*l")
+    f:close()
+    return tonumber(line)
+end
 
-    -- lsof is available on macOS and most Linux distros.
-    -- -t: terse output (PIDs only), -i: internet address filter, -sTCP:LISTEN
+-- Best-effort PID lookup for foreground mode via lsof.
+local function discover_pid_by_port(port)
+    if not port then return nil end
     local cmd = string.format(
         "lsof -t -i TCP:%d -sTCP:LISTEN 2>/dev/null | head -1", port)
     local handle = io.popen(cmd)
     if not handle then return nil end
     local out = handle:read("*l")
     handle:close()
-    return tonumber(out)   -- nil if empty or non-numeric
+    return tonumber(out)
 end
 
 -- ---------------------------------------------------------------------------
--- Public API
+-- Public API: state transitions
 -- ---------------------------------------------------------------------------
 
--- Call this just before io.popen launches llama-server.
--- *model_name*: string — the model name (no .gguf suffix)
--- *port*: integer or nil — parsed from the argv
-function M.mark_running(model_name, port)
+-- Mark a model as running.  Call before launching the process.
+-- mode: "foreground" | "daemon"
+function M.mark_running(model_name, port, mode)
     local data = load_state()
-
-    -- Remove any stale entry for this model
     for i = #data.servers, 1, -1 do
         if data.servers[i].model == model_name then
             table.remove(data.servers, i)
@@ -111,25 +132,24 @@ function M.mark_running(model_name, port)
     local entry = {
         model      = model_name,
         port       = port or json.null,
-        pid        = json.null,           -- will be updated by mark_pid_discovered
+        pid        = json.null,
+        mode       = mode or "foreground",
         state      = "running",
         started_at = util.iso8601(),
     }
+    if mode == "daemon" then
+        entry.log_file = M.log_file_for(model_name)
+    end
 
     table.insert(data.servers, 1, entry)
     data.last_used = model_name
-
     save_state(data)
     return entry
 end
 
--- Call this after the server has had a moment to bind its port.
--- Attempts PID discovery and patches the state file in place.
-function M.try_update_pid(model_name, port)
-    if not port then return end
-    local pid = discover_pid(port)
+-- Write a concrete PID into the running entry.
+function M.update_pid(model_name, pid)
     if not pid then return end
-
     local data = load_state()
     for _, entry in ipairs(data.servers) do
         if entry.model == model_name and entry.state == "running" then
@@ -140,11 +160,15 @@ function M.try_update_pid(model_name, port)
     save_state(data)
 end
 
--- Call this when the server process exits (normally or via interrupt).
--- *exit_code*: integer
+-- Best-effort lsof PID update for the foreground path.
+function M.try_update_pid(model_name, port)
+    local pid = discover_pid_by_port(port)
+    if pid then M.update_pid(model_name, pid) end
+end
+
+-- Mark a model as stopped.
 function M.mark_stopped(model_name, exit_code)
     local data = load_state()
-
     for _, entry in ipairs(data.servers) do
         if entry.model == model_name and entry.state == "running" then
             entry.state      = "stopped"
@@ -153,39 +177,75 @@ function M.mark_stopped(model_name, exit_code)
             break
         end
     end
-
     save_state(data)
 end
 
--- Returns the current state table (or an empty one if the file doesn't exist).
+-- Return the current state table.
 function M.get_state()
     return load_state()
+end
+
+-- ---------------------------------------------------------------------------
+-- luallm start <model> — daemon launch
+-- ---------------------------------------------------------------------------
+
+-- Called by model_info.start_model_daemon after building the command.
+-- Launches the server in the background; writes PID to a pidfile; returns
+-- the PID and log path so the caller can print a confirmation.
+function M.launch_daemon(model_name, cmd, port)
+    ensure_dirs()
+
+    local log_path = M.log_file_for(model_name)
+    local pid_path = pid_file_for(model_name)
+
+    -- Truncate the log file at launch so stale output is never shown
+    local lf = io.open(log_path, "w")
+    if lf then lf:close() end
+
+    -- Shell one-liner:
+    --   nohup … redirects so the process survives terminal close.
+    --   >> appends; the explicit truncation above handles the "overwrite each launch" requirement.
+    --   $! is the PID of the backgrounded nohup process.
+    local shell_cmd = string.format(
+        "nohup %s >> %s 2>&1 & echo $! > %s",
+        cmd,
+        util.sh_quote(log_path),
+        util.sh_quote(pid_path)
+    )
+
+    M.mark_running(model_name, port, "daemon")
+
+    local ok = os.execute(shell_cmd)
+    if not ok then
+        M.mark_stopped(model_name, 1)
+        return nil, "failed to launch server"
+    end
+
+    -- Give the shell a moment to write the pidfile then read it
+    os.execute("sleep 0.3")
+    local pid = read_pid_file(model_name)
+    if pid then
+        M.update_pid(model_name, pid)
+    end
+
+    return pid, log_path
 end
 
 -- ---------------------------------------------------------------------------
 -- luallm stop <model>
 -- ---------------------------------------------------------------------------
 
--- Find a running server entry by fuzzy model name match.
-local function find_running(model_query)
+local function find_running_entry(model_query)
     local data = load_state()
-    local query_lower = model_query:lower()
+    local q = model_query:lower()
     for _, entry in ipairs(data.servers) do
-        if entry.state == "running" then
-            if entry.model:lower():find(query_lower, 1, true) then
-                return entry
-            end
+        if entry.state == "running" and entry.model:lower():find(q, 1, true) then
+            return entry
         end
     end
     return nil
 end
 
--- Attempt to stop a running server.
--- Strategy:
---   1. Look up the server in state.json by model name.
---   2. If we have a PID, send SIGTERM directly.
---   3. If we have a port but no PID, discover PID via lsof then SIGTERM.
---   4. Mark stopped in state.json.
 function M.handle_stop_command(args, cfg)
     local model_query = args[2]
     if not model_query then
@@ -194,44 +254,44 @@ function M.handle_stop_command(args, cfg)
         os.exit(1)
     end
 
-    local entry = find_running(model_query)
+    local entry = find_running_entry(model_query)
     if not entry then
         print("No running server found matching: " .. model_query)
-
-        -- Show what is in state.json so the user knows what's available
         local data = load_state()
         local running = {}
         for _, e in ipairs(data.servers) do
-            if e.state == "running" then
-                table.insert(running, e.model)
-            end
+            if e.state == "running" then table.insert(running, e.model) end
         end
         if #running > 0 then
             print()
             print("Currently running (per state.json):")
-            for _, name in ipairs(running) do
-                print("  " .. name)
-            end
+            for _, name in ipairs(running) do print("  " .. name) end
         end
         os.exit(1)
     end
 
-    -- Resolve PID
-    local pid = (entry.pid ~= json.null and type(entry.pid) == "number")
-                and entry.pid
-                or  discover_pid(type(entry.port) == "number" and entry.port or nil)
+    -- PID resolution priority: pidfile → state.json → lsof
+    local pid = read_pid_file(entry.model)
+    if not pid then
+        pid = type(entry.pid) == "number" and entry.pid or nil
+    end
+    if not pid then
+        pid = discover_pid_by_port(type(entry.port) == "number" and entry.port or nil)
+    end
 
     if pid then
         print(string.format("Stopping %s (PID %d)...", entry.model, pid))
-        local kill_cmd = string.format("kill -TERM %d 2>/dev/null", pid)
-        os.execute(kill_cmd)
-        -- Give the process a moment to exit, then check
+        os.execute(string.format("kill -TERM %d 2>/dev/null", pid))
         os.execute("sleep 1")
-        local still_alive = discover_pid(type(entry.port) == "number" and entry.port or nil)
-        if still_alive then
-            print("Process did not exit after SIGTERM; sending SIGKILL...")
+        -- Escalate to SIGKILL if still alive
+        local check = io.popen(string.format("kill -0 %d 2>&1", pid))
+        local check_out = check and check:read("*a") or ""
+        if check then check:close() end
+        if not check_out:find("No such process") then
+            print("Still running after SIGTERM — sending SIGKILL...")
             os.execute(string.format("kill -KILL %d 2>/dev/null", pid))
         end
+        os.remove(pid_file_for(entry.model))
     else
         print(string.format(
             "Warning: no PID found for %s — cannot send signal.", entry.model))
@@ -239,7 +299,7 @@ function M.handle_stop_command(args, cfg)
     end
 
     M.mark_stopped(entry.model, 0)
-    print("✓ Marked " .. entry.model .. " as stopped in state.json")
+    print("✓ Marked " .. entry.model .. " as stopped")
 end
 
 -- ---------------------------------------------------------------------------
@@ -247,10 +307,8 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.handle_status_command(args, cfg)
-    -- --json flag: output raw state.json contents
     if args[2] == "--json" then
-        local data = load_state()
-        print(json.encode(data))
+        print(json.encode(load_state()))
         return
     end
 
@@ -265,56 +323,120 @@ function M.handle_status_command(args, cfg)
     print("luallm server state  (" .. M.STATE_FILE .. ")")
     print()
 
-    local running_count = 0
-    for _, entry in ipairs(data.servers) do
-        if entry.state == "running" then running_count = running_count + 1 end
+    local running, stopped = {}, {}
+    for _, e in ipairs(data.servers) do
+        if e.state == "running" then table.insert(running, e)
+        else                         table.insert(stopped, e) end
     end
 
-    -- Running servers first
-    if running_count > 0 then
+    if #running > 0 then
         print("RUNNING:")
-        for _, entry in ipairs(data.servers) do
-            if entry.state == "running" then
-                local port_str = type(entry.port) == "number"
-                                 and ("port " .. entry.port)
-                                 or  "port unknown"
-                local pid_str  = type(entry.pid) == "number"
-                                 and ("pid " .. entry.pid)
-                                 or  "pid unknown"
-                print(string.format("  %-40s  %s  %s",
-                    entry.model, port_str, pid_str))
-                if entry.started_at then
-                    print(string.format("  %s  started %s",
-                        string.rep(" ", 40), entry.started_at))
-                end
+        for _, e in ipairs(running) do
+            local port_str = type(e.port) == "number" and tostring(e.port) or "?"
+            local pid_str  = type(e.pid)  == "number" and tostring(e.pid)  or "?"
+            local mode_tag = e.mode == "daemon" and " [daemon]" or " [fg]"
+            print(string.format("  %-42s  port %-6s  pid %-7s%s",
+                e.model, port_str, pid_str, mode_tag))
+            if e.started_at then
+                print(string.format("  %s  started %s",
+                    string.rep(" ", 42), e.started_at))
+            end
+            if e.log_file then
+                print(string.format("  %s  log     %s",
+                    string.rep(" ", 42), e.log_file))
             end
         end
         print()
-    end
-
-    -- Recent stopped servers (last 5)
-    local stopped = {}
-    for _, entry in ipairs(data.servers) do
-        if entry.state == "stopped" then
-            table.insert(stopped, entry)
-        end
+    else
+        print("No servers currently running.")
+        print()
     end
 
     if #stopped > 0 then
         print("RECENTLY STOPPED:")
         for i = 1, math.min(5, #stopped) do
-            local entry = stopped[i]
-            local port_str = type(entry.port) == "number"
-                             and ("port " .. entry.port)
-                             or  "port unknown"
-            print(string.format("  %-40s  %s  stopped %s",
-                entry.model, port_str, entry.stopped_at or "unknown"))
+            local e = stopped[i]
+            local port_str = type(e.port) == "number" and tostring(e.port) or "?"
+            print(string.format("  %-42s  port %-6s  stopped %s",
+                e.model, port_str, e.stopped_at or "unknown"))
         end
         print()
     end
 
-    if data.last_used then
-        print("Last used: " .. data.last_used)
+    if data.last_used then print("Last used: " .. data.last_used) end
+end
+
+-- ---------------------------------------------------------------------------
+-- luallm logs <model> [--follow]
+-- ---------------------------------------------------------------------------
+
+function M.handle_logs_command(args, cfg)
+    local model_query = nil
+    local follow = false
+    for i = 2, #args do
+        if args[i] == "--follow" or args[i] == "-f" then
+            follow = true
+        elseif args[i]:sub(1, 1) ~= "-" and not model_query then
+            model_query = args[i]
+        end
+    end
+
+    -- If no query, find any model with an existing log file
+    if not model_query then
+        local data = load_state()
+        local candidates = {}
+        for _, e in ipairs(data.servers) do
+            if e.log_file and util.file_exists(e.log_file) then
+                table.insert(candidates, e)
+            end
+        end
+        if #candidates == 0 then
+            print("No log files found.")
+            print("Logs are created when you use: luallm start <model>")
+            os.exit(0)
+        elseif #candidates == 1 then
+            model_query = candidates[1].model
+        else
+            print("Multiple log files available:")
+            for i, e in ipairs(candidates) do
+                print(string.format("  [%d] %s", i, e.model))
+            end
+            io.write("Enter number: ")
+            io.flush()
+            local choice = tonumber(io.read("*l"))
+            if not choice or not candidates[choice] then
+                print("Invalid selection"); os.exit(1)
+            end
+            model_query = candidates[choice].model
+        end
+    end
+
+    -- Resolve log path via state.json, then fall back to canonical path
+    local log_path
+    local data = load_state()
+    local q = model_query:lower()
+    for _, e in ipairs(data.servers) do
+        if e.model:lower():find(q, 1, true) and e.log_file then
+            log_path = e.log_file
+            break
+        end
+    end
+    log_path = log_path or M.log_file_for(model_query)
+
+    if not util.file_exists(log_path) then
+        print("No log file found for: " .. model_query)
+        print("Expected: " .. log_path)
+        os.exit(1)
+    end
+
+    if follow then
+        print("Following " .. log_path .. "  (Ctrl-C to stop)")
+        print()
+        os.execute("tail -f " .. util.sh_quote(log_path))
+    else
+        print("Log: " .. log_path)
+        print()
+        os.execute("cat " .. util.sh_quote(log_path))
     end
 end
 

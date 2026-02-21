@@ -107,6 +107,35 @@ local function main(args)
     elseif args[1] == "stop" then
         state.handle_stop_command(args, cfg)
 
+    elseif args[1] == "start" then
+        -- Background daemon launch with optional --preset support
+        if #args < 2 then
+            print("Error: missing model name")
+            print("Usage: luallm start <model> [--preset <profile>] [...extra args]")
+            os.exit(1)
+        end
+        local model_query = args[2]
+        if model_query:sub(1,1) == "-" then
+            print("Error: expected a model name but got a flag: " .. model_query)
+            print("The model name must come first.")
+            print("Usage: luallm start <model> [--preset <profile>] [...extra args]")
+            os.exit(1)
+        end
+        local preset_name = nil
+        local extra_args = {}
+        local i = 3
+        while i <= #args do
+            if args[i] == "--preset" and args[i+1] then
+                preset_name = args[i+1]; i = i + 2
+            else
+                table.insert(extra_args, args[i]); i = i + 1
+            end
+        end
+        model_info.start_model_daemon(cfg, model_query, extra_args, preset_name)
+
+    elseif args[1] == "logs" then
+        state.handle_logs_command(args, cfg)
+
     elseif args[1] == "run" then
         -- New explicit run command with --preset support
         if #args < 2 then
@@ -324,6 +353,53 @@ SUBCOMMAND_HELP["pin"] = function()
     print("  luallm pinned                   # List all pinned models")
 end
 
+SUBCOMMAND_HELP["start"] = function()
+    print("luallm start — Start a model as a background daemon")
+    print()
+    print("USAGE:")
+    print("  luallm start <model> [--preset <profile>] [extra llama.cpp flags...]")
+    print()
+    print("  Launches llama-server in the background and returns immediately.")
+    print("  The model name must come before any flags.")
+    print()
+    print("  PID is captured exactly via shell $! and written to state.json.")
+    print("  stdout/stderr are redirected to a log file (overwritten each launch).")
+    print("  Log: ~/.cache/luallm/logs/<model>.log")
+    print()
+    print("  Multiple servers can run simultaneously on different ports.")
+    print("  Use different --port values in default_params or via extra flags.")
+    print()
+    print("OPTIONS:")
+    print("  --preset <profile>   Load saved preset flags  (throughput, cold-start)")
+    print()
+    print("EXAMPLES:")
+    print("  luallm start mistral                        # Start with default settings")
+    print("  luallm start mistral --preset throughput    # Start with preset")
+    print("  luallm start mistral --port 8081            # Start on a specific port")
+    print("  luallm logs mistral --follow                # Tail the log")
+    print("  luallm stop mistral                         # Stop it")
+end
+
+SUBCOMMAND_HELP["logs"] = function()
+    print("luallm logs — View the log file for a daemon-mode server")
+    print()
+    print("USAGE:")
+    print("  luallm logs [model] [--follow]")
+    print()
+    print("  Daemon servers (started with luallm start) redirect their output")
+    print("  to a log file instead of stdout.")
+    print("  Log location: ~/.cache/luallm/logs/<model>.log")
+    print("  The log file is overwritten each time the model is started.")
+    print()
+    print("OPTIONS:")
+    print("  --follow, -f    Tail the log in real time  (like tail -f)")
+    print()
+    print("EXAMPLES:")
+    print("  luallm logs mistral                 # Print full log")
+    print("  luallm logs mistral --follow        # Tail in real time")
+    print("  luallm logs                         # Pick from available logs")
+end
+
 SUBCOMMAND_HELP["stop"] = function()
     print("luallm stop — Stop a running llama-server instance")
     print()
@@ -382,10 +458,12 @@ function print_help(subcommand)
     print()
     print("RUNNING MODELS:")
     print("  luallm                  Interactive picker (most-recent first)")
-    print("  luallm <model>          Run a model  (fuzzy name match)")
-    print("  luallm run <model>      Run with optional --preset flag")
+    print("  luallm <model>          Run a model in the foreground (fuzzy name match)")
+    print("  luallm run <model>      Run in foreground with optional --preset flag")
+    print("  luallm start <model>    Start as background daemon (returns immediately)")
     print("  luallm stop <model>     Stop a running server")
     print("  luallm status           Show running and recently stopped servers")
+    print("  luallm logs <model>     View daemon log  (--follow to tail)")
     print()
     print("MODEL MANAGEMENT:")
     print("  luallm list             List all models")
@@ -407,6 +485,8 @@ function print_help(subcommand)
     print()
     print("DETAILED HELP:")
     print("  luallm help run         Running models with presets and flags")
+    print("  luallm help start       Background daemon launch, PID tracking, log files")
+    print("  luallm help logs        Viewing daemon server logs")
     print("  luallm help stop        Stopping a running server")
     print("  luallm help status      Checking server state (JSON output)")
     print("  luallm help bench       Benchmarking and comparing models")

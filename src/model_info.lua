@@ -317,11 +317,38 @@ local function find_matching_override(model_name, overrides)
     return nil
 end
 
+-- Read occupied ports from state.json without requiring the state module
+-- (avoids circular dependency at load time).
+local function occupied_ports()
+    local state_path = (os.getenv("XDG_CACHE_HOME") or
+                        (os.getenv("HOME") .. "/.cache")) .. "/luallm/state.json"
+    local f = io.open(state_path, "r")
+    if not f then return {} end
+    local content = f:read("*a")
+    f:close()
+    local ok, data = pcall(function() return require("cjson").decode(content) end)
+    if not ok or type((data or {}).servers) ~= "table" then return {} end
+    local ports = {}
+    for _, entry in ipairs(data.servers) do
+        if entry.state == "running" and type(entry.port) == "number" then
+            ports[entry.port] = true
+        end
+    end
+    return ports
+end
+
+-- Find the lowest port >= base that is not in the occupied set.
+local function next_free_port(base, occupied)
+    local p = base
+    while occupied[p] do p = p + 1 end
+    return p
+end
+
 local function build_llama_command(config, model_name, extra_args, preset_flags)
     local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
-    
+
     local argv = {util.expand_path(config.llama_cpp_path), "-m", model_path}
-    
+
     local function add_params(params)
         for _, param in ipairs(params) do
             for arg in param:gmatch("%S+") do
@@ -329,38 +356,97 @@ local function build_llama_command(config, model_name, extra_args, preset_flags)
             end
         end
     end
-    
-    -- Add default params
-    if config.default_params then
-        add_params(config.default_params)
+
+    -- Build a set of flags covered by the preset so we can suppress duplicates
+    -- from default_params (preset wins).
+    local preset_flag_set = {}
+    if preset_flags then
+        for _, token in ipairs(preset_flags) do
+            if token:sub(1, 1) == "-" then
+                preset_flag_set[token] = true
+            end
+        end
     end
-    
-    -- Add preset flags (if provided)
+
+    -- Add default_params, skipping any flag the preset already covers.
+    -- Also strip --port / -p from default_params entirely — port is managed
+    -- below via cfg.default_port so we always know exactly what port is used.
+    if config.default_params then
+        for _, param in ipairs(config.default_params) do
+            local tokens = {}
+            for tok in param:gmatch("%S+") do table.insert(tokens, tok) end
+            local i = 1
+            while i <= #tokens do
+                local tok = tokens[i]
+                if tok == "--port" or tok == "-p" then
+                    i = i + 2  -- strip port from default_params; managed below
+                elseif tok:match("^%-%-port=") or tok:match("^%-p=") then
+                    i = i + 1  -- strip --port=N form too
+                elseif tok:sub(1, 1) == "-" and preset_flag_set[tok] then
+                    i = i + 2  -- preset overrides this flag
+                else
+                    table.insert(argv, tok)
+                    i = i + 1
+                end
+            end
+        end
+    end
+
+    -- Add preset flags
     if preset_flags then
         for _, flag in ipairs(preset_flags) do
             table.insert(argv, flag)
         end
     end
-    
+
     -- Add model-specific overrides
     local override = find_matching_override(model_name, config.model_overrides or {})
-    if override then
-        add_params(override)
-    end
-    
-    -- Add extra args (these override everything)
+    if override then add_params(override) end
+
+    -- Add extra args (caller-supplied, override everything)
     if extra_args then
         for _, arg in ipairs(extra_args) do
             table.insert(argv, arg)
         end
     end
-    
-    local quoted_argv = {}
-    for i = 1, #argv do
-        quoted_argv[i] = util.sh_quote(argv[i])
+
+    -- ── Port injection ──────────────────────────────────────────────────────
+    -- If extra_args already contains --port, honour it and don't add another.
+    local caller_port = nil
+    for i, arg in ipairs(argv) do
+        if (arg == "--port" or arg == "-p") and argv[i+1] then
+            caller_port = tonumber(argv[i+1])
+            break
+        end
     end
-    
+
+    if not caller_port then
+        -- Use cfg.default_port (preferred) or fall back to 8080.
+        local base = tonumber(config.default_port) or 8080
+        local port = next_free_port(base, occupied_ports())
+        if port ~= base then
+            print(string.format(
+                "Port %d already in use — starting on port %d instead", base, port))
+        end
+        table.insert(argv, "--port")
+        table.insert(argv, tostring(port))
+    end
+    -- ───────────────────────────────────────────────────────────────────────
+
+    local quoted_argv = {}
+    for i = 1, #argv do quoted_argv[i] = util.sh_quote(argv[i]) end
+
     return table.concat(quoted_argv, " "), argv
+end
+
+-- Extract the port from a built argv (always "--port N" after build_llama_command).
+local function port_from_argv(argv)
+    for i, arg in ipairs(argv) do
+        if (arg == "--port" or arg == "-p") and argv[i+1] then
+            return tonumber(argv[i+1])
+        end
+    end
+    return nil
 end
 
 function M.run_model(config, model_name, extra_args, preset_name)
@@ -394,12 +480,11 @@ function M.run_model(config, model_name, extra_args, preset_name)
     end
     
     local state = require("state")
-
     local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
     print("Starting llama.cpp with: " .. model_name)
     print("Command: " .. cmd)
     print()
-    
+
     local run_config = {
         llama_cpp_path = util.expand_path(config.llama_cpp_path),
         argv = argv,
@@ -407,14 +492,11 @@ function M.run_model(config, model_name, extra_args, preset_name)
         model_name = model_name,
         extra_args = (extra_args and #extra_args > 0) and extra_args or json.empty_array
     }
-    
+
     for i, arg in ipairs(argv) do
-        if arg == "--host" and argv[i+1] then
-            run_config.host = argv[i+1]
-        elseif arg == "--port" and argv[i+1] then
-            run_config.port = tonumber(argv[i+1])
-        end
+        if arg == "--host" and argv[i+1] then run_config.host = argv[i+1] end
     end
+    run_config.port = port_from_argv(argv)
     
     local captured_lines = {}
     local capture_count = 0
@@ -440,8 +522,6 @@ function M.run_model(config, model_name, extra_args, preset_name)
         if #captured_lines > 0 then
             save_model_info(config, model_name, captured_lines, run_config, end_reason, final_exit_code)
         end
-
-        state.mark_stopped(model_name, final_exit_code)
         
         local status = "exited"
         if opts.interrupted then
@@ -451,10 +531,11 @@ function M.run_model(config, model_name, extra_args, preset_name)
         end
         
         history.add_to_history(model_name, status, final_exit_code)
+        state.mark_stopped(model_name, final_exit_code)
     end
-    
+
     history.add_to_history(model_name, "running", nil)
-    state.mark_running(model_name, run_config.port)
+    state.mark_running(model_name, run_config.port, "foreground")
 
     local ok, err = xpcall(function()
         pipe = io.popen(cmd .. " 2>&1", "r")
@@ -466,43 +547,43 @@ function M.run_model(config, model_name, extra_args, preset_name)
         for line in pipe:lines() do
             print(line)
 
-            -- After the server has had a few lines to bind its port,
-            -- attempt a one-shot PID discovery (non-blocking best-effort).
+            -- After a few lines the server has usually bound its port;
+            -- attempt a one-shot lsof PID discovery.
             if not pid_updated and capture_count >= 3 then
                 state.try_update_pid(model_name, run_config.port)
                 pid_updated = true
             end
-            
+
             if capturing and should_capture_line(line) then
                 local sanitized_line = sanitize_large_arrays(line)
                 table.insert(captured_lines, sanitized_line)
                 capture_count = capture_count + 1
                 capture_bytes = capture_bytes + #sanitized_line
-                
+
                 if not info_written and #captured_lines >= 10 then
                     save_model_info(config, model_name, captured_lines, run_config, "running", 0)
                     info_written = true
                 end
-                
+
                 if capture_count >= max_capture_lines or capture_bytes >= max_capture_bytes then
                     capturing = false
                 end
             end
         end
-        
+
         local close_ok, reason, code = pipe:close()
         pipe = nil
         local exit_code = util.normalize_exit_code(close_ok, reason, code)
-        
+
         finalize({ exit_code = exit_code, interrupted = false })
-        
+
         if exit_code ~= 0 then
             print(("Error: llama.cpp exited with code %d"):format(exit_code))
             os.exit(exit_code)
         end
-        
+
     end, debug.traceback)
-    
+
     if not ok then
         local err_msg = tostring(err)
         if err_msg:match("interrupted") then
@@ -515,6 +596,66 @@ function M.run_model(config, model_name, extra_args, preset_name)
             error(err)
         end
     end
+end
+
+-- Start a model as a background daemon (luallm start <model>).
+-- stdout/stderr go to a log file; PID is captured exactly via shell $!.
+function M.start_model_daemon(config, model_query, extra_args, preset_name)
+    if not model_query then
+        print("Error: missing model name")
+        print("Usage: luallm start <model> [--preset <profile>] [extra flags...]")
+        os.exit(1)
+    end
+
+    local resolver = require("resolver")
+    local model_name = resolver.resolve_or_exit(config, model_query, {
+        title = "Select model to start:"
+    })
+
+    local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
+    if not util.file_exists(model_path) then
+        print("Error: Model file not found: " .. model_path)
+        os.exit(1)
+    end
+
+    local preset_flags = nil
+    if preset_name then
+        local recommend = require("recommend")
+        local preset = recommend.load_preset(config, model_name, preset_name)
+        if not preset then
+            print("Error: No '" .. preset_name .. "' preset found for " .. model_name)
+            print("Run: luallm recommend " .. preset_name .. " " .. model_name)
+            os.exit(1)
+        end
+        preset_flags = preset.flags
+        print("Using " .. preset_name .. " preset")
+    end
+
+    local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
+    local port = port_from_argv(argv)   -- always set; build_llama_command guarantees it
+
+    print("Starting daemon: " .. model_name)
+
+    local state = require("state")
+    local pid, log_path = state.launch_daemon(model_name, cmd, port)
+
+    if not pid then
+        print("Error: failed to start server")
+        if log_path then print("Log: " .. log_path) end
+        os.exit(1)
+    end
+
+    print(string.format("✓ Started  PID %d", pid))
+    if port then
+        print(string.format("  Listening  http://127.0.0.1:%d", port))
+        print(string.format("  API        http://127.0.0.1:%d/v1/chat/completions", port))
+    end
+    print(string.format("  Log        %s", log_path))
+    print()
+    print(string.format("  luallm logs %s --follow", model_name))
+    print(string.format("  luallm stop %s", model_name))
+
+    history.add_to_history(model_name, "running", nil)
 end
 
 function M.rebuild_llama(config)
