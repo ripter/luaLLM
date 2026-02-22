@@ -60,8 +60,12 @@ local function main(args)
         
     elseif args[1] == "list" then
         local models = model_info.list_models(cfg.models_dir)
-        print("Available models in " .. util.expand_path(cfg.models_dir) .. ":\n")
-        format.print_model_list(models, cfg.models_dir, cfg)
+        if args[2] == "--json" then
+            format.print_model_list_json(models, cfg.models_dir, cfg)
+        else
+            print("Available models in " .. util.expand_path(cfg.models_dir) .. ":\n")
+            format.print_model_list(models, cfg.models_dir, cfg)
+        end
         
     elseif args[1] == "info" then
         model_info.handle_info_command(args, cfg)
@@ -164,7 +168,7 @@ local function main(args)
         model_info.run_model(cfg, model_name, extra_args, preset_name)
         
     elseif args[1] == "help" or args[1] == "--help" or args[1] == "-h" then
-        print_help(args[2])
+        print_help(args[2], args[3])
         
     else
         local model_query = args[1]
@@ -285,11 +289,19 @@ SUBCOMMAND_HELP["notes"] = function()
     print("  list                 List all models that have notes")
     print("  path <model>         Print the path to the notes file")
     print()
+    print("OPTIONS:")
+    print("  --json    Output as JSON instead of human-readable text")
+    print("            Works with: luallm notes --json")
+    print("                        luallm notes <model> --json")
+    print("                        luallm notes list --json")
+    print()
     print("EXAMPLES:")
     print("  luallm notes mistral                        # View notes")
     print("  luallm notes add mistral \"great for coding\" # Add a note")
     print("  luallm notes edit mistral                   # Edit in $EDITOR")
     print("  luallm notes list                           # See all annotated models")
+    print("  luallm notes list --json                    # Machine-readable list")
+    print("  luallm notes mistral --json                 # Machine-readable notes")
 end
 
 SUBCOMMAND_HELP["info"] = function()
@@ -416,6 +428,57 @@ SUBCOMMAND_HELP["stop"] = function()
     print("  luallm stop all                 # Stop every running server")
 end
 
+SUBCOMMAND_HELP["list"] = function()
+    print("luallm list — List all available models")
+    print()
+    print("USAGE:")
+    print("  luallm list")
+    print("  luallm list --json")
+    print()
+    print("  Scans models_dir and shows name, size, quantization, and last run time.")
+    print("  Results are sorted most-recently-used first.")
+    print()
+    print("OPTIONS:")
+    print("  --json    Output model list as a JSON array (for scripting)")
+    print()
+    print("JSON FIELDS (per model):")
+    print("  name           Model filename without .gguf extension")
+    print("  size           Human-readable file size (e.g. \"7.2 GB\")")
+    print("  quantization   Quantization level extracted from name (e.g. \"Q4_K_M\")")
+    print("  last_run       Human-readable last run time (e.g. \"2 days ago\")")
+    print()
+    print("EXAMPLES:")
+    print("  luallm list                 # Human-readable table")
+    print("  luallm list --json          # Machine-readable JSON array")
+    print("  luallm list --json | jq '.[].name'   # Extract just model names")
+end
+
+SUBCOMMAND_HELP["help"] = function()
+    print("luallm help — Show help for commands")
+    print()
+    print("USAGE:")
+    print("  luallm help")
+    print("  luallm help <command>")
+    print("  luallm help --json")
+    print("  luallm help <command> --json")
+    print()
+    print("OPTIONS:")
+    print("  --json    Output help as a structured JSON object or array")
+    print()
+    print("JSON FIELDS (per command):")
+    print("  name           Command name")
+    print("  group          Category (running, management, benchmarking, utilities)")
+    print("  description    One-line description")
+    print("  options        Array of {flag, description} objects")
+    print("  subcommands    Array of {name, description} objects (if applicable)")
+    print()
+    print("EXAMPLES:")
+    print("  luallm help                     # Full human-readable help")
+    print("  luallm help bench               # Detailed help for bench")
+    print("  luallm help --json              # Full command catalogue as JSON")
+    print("  luallm help bench --json        # Bench command detail as JSON")
+end
+
 SUBCOMMAND_HELP["status"] = function()
     print("luallm status — Show running and recently stopped servers")
     print()
@@ -437,8 +500,112 @@ SUBCOMMAND_HELP["status"] = function()
     print("  cat ~/.cache/luallm/state.json  # Direct file access")
 end
 
-function print_help(subcommand)
-    -- Subcommand detail page
+function print_help(subcommand, flag)
+    local want_json = (flag == "--json") or (subcommand == "--json")
+    if subcommand == "--json" then subcommand = nil end
+
+    -- JSON output: structured data for all commands or a specific subcommand
+    if want_json then
+        local json_ok, json = pcall(require, "cjson")
+        if not json_ok then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+
+        -- Top-level command catalogue
+        local commands = {
+            { name = "run",         group = "running",     description = "Run a model in the foreground with optional --preset flag" },
+            { name = "start",       group = "running",     description = "Start a model as a background daemon" },
+            { name = "stop",        group = "running",     description = "Stop a running server" },
+            { name = "status",      group = "running",     description = "Show running and recently stopped servers" },
+            { name = "logs",        group = "running",     description = "View daemon log (--follow to tail)" },
+            { name = "list",        group = "management",  description = "List all models" },
+            { name = "info",        group = "management",  description = "Show cached metadata for a model" },
+            { name = "join",        group = "management",  description = "Merge multi-part GGUF files" },
+            { name = "pin",         group = "management",  description = "Pin a model for quick picker access" },
+            { name = "unpin",       group = "management",  description = "Unpin a model" },
+            { name = "pinned",      group = "management",  description = "List all pinned models" },
+            { name = "notes",       group = "management",  description = "Attach freeform notes to a model" },
+            { name = "bench",       group = "benchmarking",description = "Benchmark a model using llama-bench" },
+            { name = "recommend",   group = "benchmarking",description = "Generate optimised run presets" },
+            { name = "doctor",      group = "utilities",   description = "Run configuration diagnostics" },
+            { name = "config",      group = "utilities",   description = "Show config file location" },
+            { name = "rebuild",     group = "utilities",   description = "Rebuild llama.cpp from source" },
+            { name = "clear-history", group = "utilities", description = "Clear run history" },
+        }
+
+        -- Options per command
+        local options = {
+            run       = { { flag = "--preset <profile>", description = "Load saved preset flags (throughput, cold-start, context)" } },
+            start     = { { flag = "--preset <profile>", description = "Load saved preset flags" } },
+            status    = { { flag = "--json",             description = "Output raw state as JSON" } },
+            logs      = { { flag = "--follow, -f",       description = "Tail the log in real time" } },
+            list      = { { flag = "--json",             description = "Output model list as JSON" } },
+            info      = {
+                { flag = "--kv",  description = "Show GGUF key-value pairs" },
+                { flag = "--raw", description = "Show raw captured llama.cpp output" },
+            },
+            bench     = {
+                { flag = "--n <N>",        description = "Number of benchmark runs (default: 5)" },
+                { flag = "--warmup <W>",   description = "Warmup runs before measuring (default: 1)" },
+                { flag = "--threads <T>",  description = "Thread count to benchmark at" },
+                { flag = "--verbose",      description = "Include hardware details (bench compare)" },
+            },
+            notes     = { { flag = "--json", description = "Output notes as JSON" } },
+            help      = { { flag = "--json", description = "Output help as JSON" } },
+        }
+
+        -- Subcommands per command
+        local subcommands_map = {
+            bench = {
+                { name = "show [model]",            description = "View saved benchmark results" },
+                { name = "compare <A> <B>",         description = "Compare results for two models side by side" },
+                { name = "clear",                   description = "Delete all saved benchmark logs" },
+            },
+            notes = {
+                { name = "add <model> <text>",      description = "Append a timestamped note" },
+                { name = "edit [model]",            description = "Open notes file in $EDITOR" },
+                { name = "list",                    description = "List all models that have notes" },
+                { name = "path <model>",            description = "Print the path to the notes file" },
+            },
+        }
+
+        if subcommand then
+            -- Single-command detail
+            local found = nil
+            for _, c in ipairs(commands) do
+                if c.name == subcommand then found = c; break end
+            end
+            if not found then
+                io.stderr:write("No help available for '" .. subcommand .. "'\n")
+                os.exit(1)
+            end
+            local out = {
+                name        = found.name,
+                group       = found.group,
+                description = found.description,
+                options     = options[found.name] or {},
+                subcommands = subcommands_map[found.name] or {},
+            }
+            print(json.encode(out))
+        else
+            -- Full catalogue
+            local out = {}
+            for _, c in ipairs(commands) do
+                table.insert(out, {
+                    name        = c.name,
+                    group       = c.group,
+                    description = c.description,
+                    options     = options[c.name] or {},
+                    subcommands = subcommands_map[c.name] or {},
+                })
+            end
+            print(json.encode(out))
+        end
+        return
+    end
+
+    -- Subcommand detail page (human-readable)
     if subcommand and SUBCOMMAND_HELP[subcommand] then
         print()
         SUBCOMMAND_HELP[subcommand]()
@@ -489,13 +656,15 @@ function print_help(subcommand)
     print("  luallm help start       Background daemon launch, PID tracking, log files")
     print("  luallm help logs        Viewing daemon server logs")
     print("  luallm help stop        Stopping a running server")
-    print("  luallm help status      Checking server state (JSON output)")
+    print("  luallm help status      Checking server state (--json output)")
     print("  luallm help bench       Benchmarking and comparing models")
     print("  luallm help recommend   Generating optimised presets")
-    print("  luallm help notes       Attaching notes to models")
+    print("  luallm help notes       Attaching notes to models (--json output)")
+    print("  luallm help list        Listing models (--json output)")
     print("  luallm help info        Viewing model metadata")
     print("  luallm help join        Merging multi-part GGUF files")
     print("  luallm help pin         Pinning models")
+    print("  luallm help help        Help command options (--json output)")
     print()
     print("Config: " .. config.CONFIG_FILE)
     print()

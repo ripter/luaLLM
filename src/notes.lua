@@ -5,6 +5,9 @@ local format = require("format")
 local resolver = require("resolver")
 local picker = require("picker")
 
+local json_ok, json = pcall(require, "cjson")
+if not json_ok then json = nil end
+
 local M = {}
 
 M.NOTES_DIR = config.CONFIG_DIR .. "/notes"
@@ -117,7 +120,27 @@ end
 function M.handle_notes_command(args, cfg)
     local subcommand = args[2]
     
-    if not subcommand then
+    if not subcommand or subcommand == "--json" then
+        -- If called as: luallm notes --json  (no model, no picker needed for JSON - show all)
+        if subcommand == "--json" then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            local models = list_models_with_notes(cfg)
+            local out = {}
+            for _, m in ipairs(models) do
+                local content = read_notes(m.name) or ""
+                table.insert(out, {
+                    name    = m.name,
+                    content = content,
+                    notes_path = get_notes_path(m.name),
+                })
+            end
+            print(json.encode(out))
+            return
+        end
+
         local model_info = require("model_info")
         local all_models = model_info.list_models(cfg.models_dir)
         if #all_models == 0 then
@@ -145,14 +168,33 @@ function M.handle_notes_command(args, cfg)
         
     elseif subcommand == "list" then
         local models = list_models_with_notes(cfg)
-        
+
+        if args[3] == "--json" then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            local out = {}
+            for _, m in ipairs(models) do
+                table.insert(out, {
+                    name     = m.name,
+                    size     = m.size_str,
+                    quantization = m.quant,
+                    last_run = m.last_run_str,
+                    notes_path = get_notes_path(m.name),
+                })
+            end
+            print(json.encode(out))
+            return
+        end
+
         if #models == 0 then
             print("No models have notes yet.")
             os.exit(0)
         end
-        
+
         print("Models with notes:\n")
-        
+
         local max_name, max_size, max_quant = format.calculate_column_widths(models)
         for _, m in ipairs(models) do
             print("  " .. format.format_model_row(m, max_name, max_size, max_quant))
@@ -221,17 +263,33 @@ function M.handle_notes_command(args, cfg)
         os.execute(cmd)
         
     else
+        -- Could be: luallm notes <model>  OR  luallm notes <model> --json
         local model_query = subcommand
+        local want_json = (args[3] == "--json")
+
         local model_name = resolver.resolve_or_exit(cfg, model_query, {
             title = "Select a model to view notes (↑/↓ arrows, Enter to confirm, q to quit):"
         })
-        
+
         local content = read_notes(model_name)
-        if content then
-            print(content)
+
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({
+                name       = model_name,
+                content    = content or json.null,
+                notes_path = get_notes_path(model_name),
+            }))
         else
-            print("No notes yet for " .. model_name .. ".")
-            print("Notes file: " .. get_notes_path(model_name))
+            if content then
+                print(content)
+            else
+                print("No notes yet for " .. model_name .. ".")
+                print("Notes file: " .. get_notes_path(model_name))
+            end
         end
     end
 end

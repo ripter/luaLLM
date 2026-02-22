@@ -4,6 +4,9 @@ local history = require("history")
 local M = {}
 local model_info
 
+local json_ok, json = pcall(require, "cjson")
+if not json_ok then json = nil end
+
 local function extract_quant(model_name)
     local quant = model_name:match("Q%d+_K_[MS]") or 
                   model_name:match("Q%d+_K") or
@@ -117,6 +120,56 @@ function M.print_model_list(models, models_dir, config)
     for _, m in ipairs(model_list) do
         print("  " .. M.format_model_row(m, max_name, max_size, max_quant))
     end
+end
+
+function M.print_model_list_json(models, models_dir, config)
+    if not json then
+        io.stderr:write("Error: cjson not available for JSON output\n")
+        os.exit(1)
+    end
+
+    local hist = history.load_history()
+
+    local model_list = {}
+    for _, model in ipairs(models) do
+        local name = type(model) == "string" and model or model.name
+        local _, size_str, quant, last_run_str = M.get_model_row(config, name)
+
+        local entry = {
+            name        = name,
+            size        = size_str,
+            quantization = quant,
+            last_run    = last_run_str,
+            last_run_ts = 0,
+        }
+
+        for _, h in ipairs(hist) do
+            local h_name = type(h) == "string" and h or h.name
+            if h_name == name then
+                entry.last_run_ts = type(h) == "table" and h.last_run or 0
+                break
+            end
+        end
+
+        table.insert(model_list, entry)
+    end
+
+    table.sort(model_list, function(a, b)
+        return a.last_run_ts > b.last_run_ts
+    end)
+
+    -- Remove internal sort key from output
+    local out = {}
+    for _, m in ipairs(model_list) do
+        table.insert(out, {
+            name         = m.name,
+            size         = m.size,
+            quantization = m.quantization,
+            last_run     = m.last_run,
+        })
+    end
+
+    print(json.encode(out))
 end
 
 return M
