@@ -480,6 +480,17 @@ function M.run_model(config, model_name, extra_args, preset_name)
     end
     
     local state = require("state")
+
+    -- Refuse to start if already running
+    local existing = state.is_running(model_name)
+    if existing then
+        local pid_str  = type(existing.pid)  == "number" and (" (PID "  .. existing.pid  .. ")") or ""
+        local port_str = type(existing.port) == "number" and (" on port " .. existing.port) or ""
+        print("Error: " .. model_name .. " is already running" .. pid_str .. port_str)
+        print("Use 'luallm stop " .. model_name .. "' first.")
+        os.exit(1)
+    end
+
     local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
     print("Starting llama.cpp with: " .. model_name)
     print("Command: " .. cmd)
@@ -637,13 +648,14 @@ function M.start_model_daemon(config, model_query, extra_args, preset_name)
     print("Starting daemon: " .. model_name)
 
     local state = require("state")
-    local pid, log_path = state.launch_daemon(model_name, cmd, port)
+    local pid, log_path_or_err = state.launch_daemon(model_name, cmd, port)
 
     if not pid then
-        print("Error: failed to start server")
-        if log_path then print("Log: " .. log_path) end
+        print("Error: " .. (log_path_or_err or "failed to start server"))
         os.exit(1)
     end
+
+    local log_path = log_path_or_err
 
     print(string.format("✓ Started  PID %d", pid))
     if port then

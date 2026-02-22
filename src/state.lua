@@ -58,6 +58,7 @@ end
 local function safe_name(model_name)
     return model_name:gsub("[^%w%-%._]", "_")
 end
+M.safe_name = safe_name
 
 function M.log_file_for(model_name)
     return LOGS_DIR .. "/" .. safe_name(model_name) .. ".log"
@@ -180,6 +181,17 @@ function M.mark_stopped(model_name, exit_code)
     save_state(data)
 end
 
+-- Return the running state entry for a model, or nil if not running.
+function M.is_running(model_name)
+    local data = load_state()
+    for _, entry in ipairs(data.servers) do
+        if entry.model == model_name and entry.state == "running" then
+            return entry
+        end
+    end
+    return nil
+end
+
 -- Return the current state table.
 function M.get_state()
     return load_state()
@@ -194,6 +206,18 @@ end
 -- the PID and log path so the caller can print a confirmation.
 function M.launch_daemon(model_name, cmd, port)
     ensure_dirs()
+
+    -- Refuse to start if already running — prevents zombie orphans
+    local existing = M.is_running(model_name)
+    if existing then
+        local pid_str = type(existing.pid) == "number"
+                        and (" (PID " .. existing.pid .. ")") or ""
+        local port_str = type(existing.port) == "number"
+                         and (" on port " .. existing.port) or ""
+        return nil, string.format(
+            "%s is already running%s%s\nUse 'luallm stop %s' first.",
+            model_name, pid_str, port_str, model_name)
+    end
 
     local log_path = M.log_file_for(model_name)
     local pid_path = pid_file_for(model_name)
@@ -232,7 +256,40 @@ function M.launch_daemon(model_name, cmd, port)
 end
 
 -- ---------------------------------------------------------------------------
--- luallm stop <model>
+-- Private: stop one running entry — shared by "stop <model>" and "stop all"
+-- Returns true on success, or false + error string on failure.
+-- ---------------------------------------------------------------------------
+local function _stop_one(entry)
+    -- PID resolution priority: pidfile → state.json → lsof
+    local pid = read_pid_file(entry.model)
+    if not pid then
+        pid = type(entry.pid) == "number" and entry.pid or nil
+    end
+    if not pid then
+        pid = discover_pid_by_port(type(entry.port) == "number" and entry.port or nil)
+    end
+
+    if pid then
+        print(string.format("  Stopping %s (PID %d)...", entry.model, pid))
+        os.execute(string.format("kill -TERM %d 2>/dev/null", pid))
+        os.execute("sleep 1")
+        -- os.execute returns true on exit code 0 (Lua 5.2+).
+        -- kill -0 exits 0 if the process is still alive, non-zero if gone.
+        if os.execute(string.format("kill -0 %d 2>/dev/null", pid)) then
+            print("  Still running after SIGTERM — sending SIGKILL...")
+            os.execute(string.format("kill -KILL %d 2>/dev/null", pid))
+        end
+        os.remove(pid_file_for(entry.model))
+    else
+        return false, "no PID found"
+    end
+
+    M.mark_stopped(entry.model, 0)
+    return true
+end
+
+-- ---------------------------------------------------------------------------
+-- luallm stop <model> | all
 -- ---------------------------------------------------------------------------
 
 local function find_running_entry(model_query)
@@ -248,9 +305,45 @@ end
 
 function M.handle_stop_command(args, cfg)
     local model_query = args[2]
+
+    -- "stop all" — stop every running server
+    if model_query and model_query:lower() == "all" then
+        local data = load_state()
+        local running = {}
+        for _, e in ipairs(data.servers) do
+            if e.state == "running" then table.insert(running, e) end
+        end
+
+        if #running == 0 then
+            print("No servers are currently running.")
+            return
+        end
+
+        print("Stopping " .. #running .. " running server(s)...")
+        local failed = 0
+        for _, entry in ipairs(running) do
+            local ok, err = _stop_one(entry)
+            if not ok then
+                print("  ✗ " .. entry.model .. ": " .. (err or "unknown error"))
+                failed = failed + 1
+            else
+                print("  ✓ Stopped " .. entry.model)
+            end
+        end
+        print()
+        if failed == 0 then
+            print("All servers stopped.")
+        else
+            print(string.format("Stopped %d/%d. %d failed.",
+                #running - failed, #running, failed))
+        end
+        return
+    end
+
+    -- "stop <model>"
     if not model_query then
         print("Error: missing model name")
-        print("Usage: luallm stop <model>")
+        print("Usage: luallm stop <model> | all")
         os.exit(1)
     end
 
@@ -270,36 +363,12 @@ function M.handle_stop_command(args, cfg)
         os.exit(1)
     end
 
-    -- PID resolution priority: pidfile → state.json → lsof
-    local pid = read_pid_file(entry.model)
-    if not pid then
-        pid = type(entry.pid) == "number" and entry.pid or nil
-    end
-    if not pid then
-        pid = discover_pid_by_port(type(entry.port) == "number" and entry.port or nil)
-    end
-
-    if pid then
-        print(string.format("Stopping %s (PID %d)...", entry.model, pid))
-        os.execute(string.format("kill -TERM %d 2>/dev/null", pid))
-        os.execute("sleep 1")
-        -- Escalate to SIGKILL if still alive
-        local check = io.popen(string.format("kill -0 %d 2>&1", pid))
-        local check_out = check and check:read("*a") or ""
-        if check then check:close() end
-        if not check_out:find("No such process") then
-            print("Still running after SIGTERM — sending SIGKILL...")
-            os.execute(string.format("kill -KILL %d 2>/dev/null", pid))
-        end
-        os.remove(pid_file_for(entry.model))
-    else
-        print(string.format(
-            "Warning: no PID found for %s — cannot send signal.", entry.model))
+    local ok, err = _stop_one(entry)
+    if not ok then
+        print("Warning: " .. (err or "could not send signal"))
         print("If the server is still running, stop it manually.")
     end
-
-    M.mark_stopped(entry.model, 0)
-    print("✓ Marked " .. entry.model .. " as stopped")
+    print("✓ " .. entry.model .. " stopped")
 end
 
 -- ---------------------------------------------------------------------------
