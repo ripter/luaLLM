@@ -213,7 +213,7 @@ function M.launch_daemon(model_name, cmd, port)
         local pid_str = type(existing.pid) == "number"
                         and (" (PID " .. existing.pid .. ")") or ""
         local port_str = type(existing.port) == "number"
-                         and (" on port " .. existing.port) or ""
+                         and (" on port " .. math.floor(existing.port)) or ""
         return nil, string.format(
             "%s is already running%s%s\nUse 'luallm stop %s' first.",
             model_name, pid_str, port_str, model_name)
@@ -401,7 +401,7 @@ function M.handle_status_command(args, cfg)
     if #running > 0 then
         print("RUNNING:")
         for _, e in ipairs(running) do
-            local port_str = type(e.port) == "number" and tostring(e.port) or "?"
+            local port_str = type(e.port) == "number" and tostring(math.floor(e.port)) or "?"
             local pid_str  = type(e.pid)  == "number" and tostring(e.pid)  or "?"
             local mode_tag = e.mode == "daemon" and " [daemon]" or " [fg]"
             print(string.format("  %-42s  port %-6s  pid %-7s%s",
@@ -425,7 +425,7 @@ function M.handle_status_command(args, cfg)
         print("RECENTLY STOPPED:")
         for i = 1, math.min(5, #stopped) do
             local e = stopped[i]
-            local port_str = type(e.port) == "number" and tostring(e.port) or "?"
+            local port_str = type(e.port) == "number" and tostring(math.floor(e.port)) or "?"
             print(string.format("  %-42s  port %-6s  stopped %s",
                 e.model, port_str, e.stopped_at or "unknown"))
         end
