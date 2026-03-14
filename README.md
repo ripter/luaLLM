@@ -1,8 +1,8 @@
 # luaLLM
 
-A fast, scriptable command-line tool for managing, running, benchmarking, and optimizing local LLMs. Built in Lua on top of [llama.cpp](https://github.com/ggerganov/llama.cpp).
+Drop a folder full of `.gguf` model files, point luaLLM at it, and start using them immediately. No flag fiddling — sensible defaults work out of the box. Pick a model from the interactive TUI or type a partial name. When you need more speed, the built-in benchmark and recommendation engine will find your optimal settings automatically.
 
-Launch models interactively or as background daemons. Pin your favorites. Benchmark performance across thread counts, KV cache types, and flash attention configs. Let the recommendation engine find your fastest settings automatically. Keep freeform notes on every model. All from a single `luallm` command.
+A fast, scriptable command-line tool for managing, running, benchmarking, and optimizing local LLMs. Built in Lua on top of [llama.cpp](https://github.com/ggerganov/llama.cpp).
 
 ---
 
