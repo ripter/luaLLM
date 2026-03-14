@@ -38,7 +38,7 @@ Launch models interactively or as background daemons. Pin your favorites. Benchm
 ```bash
 # 1. Install
 brew install lua luarocks        # macOS
-sudo make install
+make install
 
 # 2. Configure (auto-created on first run)
 luallm config                    # shows config file path — edit it to set your models_dir and llama_cpp_path
@@ -70,21 +70,24 @@ sudo apt install lua5.4 liblua5.4-dev luarocks
 ### Install with Make
 
 ```bash
-sudo make install                # installs Lua deps (lua-cjson, luafilesystem) and symlinks luallm into PATH
+make install                # installs Lua deps and symlinks to ~/.local/bin/luallm
 ```
 
-To install to a custom prefix:
+Make sure `~/.local/bin` is in your PATH (it is by default on most systems).
+
+For system-wide installation:
 
 ```bash
-sudo make install PREFIX=/usr
+sudo make install PREFIX=/usr/local
 ```
 
 ### Manual Install
 
 ```bash
-make deps                        # install lua-cjson and luafilesystem via luarocks
+make deps                         # install lua-cjson and luafilesystem via luarocks
 chmod +x luallm.lua
-sudo ln -sf $(pwd)/luallm.lua /usr/local/bin/luallm
+mkdir -p ~/.local/bin
+ln -sf $(pwd)/luallm.lua ~/.local/bin/luallm
 ```
 
 > **Note:** `luallm.lua` must be symlinked, not copied — it resolves `src/` module imports relative to the script location.

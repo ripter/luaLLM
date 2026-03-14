@@ -1,6 +1,6 @@
 .PHONY: install deps check clean uninstall help
 
-PREFIX ?= /usr/local
+PREFIX ?= $(HOME)/.local
 BINDIR = $(PREFIX)/bin
 SCRIPT = luallm.lua
 TARGET = $(BINDIR)/luallm
@@ -9,13 +9,13 @@ help:
 	@echo "luaLLM - Makefile targets:"
 	@echo ""
 	@echo "  make deps      - Install Lua dependencies (lua-cjson, luafilesystem)"
-	@echo "  make install   - Install dependencies and symlink script to $(BINDIR)"
+	@echo "  make install   - Install dependencies and symlink script to ~/.local/bin"
 	@echo "  make check     - Check if dependencies are installed"
 	@echo "  make uninstall - Remove installed script"
 	@echo "  make clean     - Remove local build artifacts"
 	@echo ""
 	@echo "Options:"
-	@echo "  PREFIX=/path   - Install location (default: /usr/local)"
+	@echo "  PREFIX=/path   - Install location (default: ~/.local)"
 
 check:
 	@echo "Checking Lua installation..."
