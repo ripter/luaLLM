@@ -1,7 +1,19 @@
 #!/usr/bin/env lua
 
 -- Determine script directory for module loading
+-- Resolve symlinks so that require() finds modules relative to the real file,
+-- not the symlink location (e.g. ~/.local/bin/luallm → /path/to/repo/luallm.lua).
 local script_path = arg[0]
+do
+    local handle = io.popen("readlink -f " .. script_path .. " 2>/dev/null || realpath " .. script_path .. " 2>/dev/null || echo " .. script_path)
+    if handle then
+        local resolved = handle:read("*l")
+        handle:close()
+        if resolved and resolved ~= "" then
+            script_path = resolved
+        end
+    end
+end
 local script_dir = script_path:match("^(.*)/[^/]+$") or "."
 package.path = script_dir .. "/src/?.lua;" .. 
                script_dir .. "/src/?/init.lua;" .. 
