@@ -201,6 +201,42 @@ function M.format_size(bytes)
     end
 end
 
+-- Resolve llama-gguf-split path from config
+function M.resolve_gguf_split_path(cfg)
+    -- Priority 1: Explicit config path
+    if cfg.llama_gguf_split_path then
+        local path = M.expand_path(cfg.llama_gguf_split_path)
+        if M.file_exists(path) then
+            return path
+        end
+    end
+
+    -- Priority 2: Derive from llama_cpp_path directory
+    if cfg.llama_cpp_path then
+        local server_path = M.expand_path(cfg.llama_cpp_path)
+        local split_path = server_path:gsub("llama%-server$", "llama-gguf-split")
+        if split_path ~= server_path and M.file_exists(split_path) then
+            return split_path
+        end
+    end
+
+    -- Priority 3: Derive from source directory
+    if cfg.llama_cpp_source_dir then
+        local src_dir = M.expand_path(cfg.llama_cpp_source_dir)
+        local candidates = {
+            src_dir .. "/build/bin/llama-gguf-split",
+            src_dir .. "/build/llama-gguf-split",
+        }
+        for _, path in ipairs(candidates) do
+            if M.file_exists(path) then
+                return path
+            end
+        end
+    end
+
+    return nil
+end
+
 -- Resolve llama-bench path from config
 function M.resolve_bench_path(cfg)
     -- Priority 1: Explicit config path
