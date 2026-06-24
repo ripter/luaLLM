@@ -89,6 +89,9 @@ local function main(args)
     elseif args[1] == "rebuild" then
         model_info.rebuild_llama(cfg)
         
+    elseif args[1] == "history" then
+        history.handle_history_command(args)
+
     elseif args[1] == "clear-history" then
         history.clear_history()
         print("✓ History cleared")
@@ -465,6 +468,29 @@ SUBCOMMAND_HELP["list"] = function()
     print("  luallm list --json | jq '.[].name'   # Extract just model names")
 end
 
+SUBCOMMAND_HELP["history"] = function()
+    print("luallm history — Show models used recently")
+    print()
+    print("USAGE:")
+    print("  luallm history")
+    print("  luallm history --json")
+    print()
+    print("  Displays each model you have run, sorted most-recently-used first.")
+    print("  Shows the run count and when the model was last used.")
+    print()
+    print("OPTIONS:")
+    print("  --json    Output as a JSON array (for scripting)")
+    print()
+    print("JSON FIELDS (per entry):")
+    print("  name        Model name")
+    print("  run_count   Number of times this model has been started")
+    print("  last_run    Unix timestamp of the most recent run")
+    print()
+    print("EXAMPLES:")
+    print("  luallm history                  # Human-readable table")
+    print("  luallm history --json           # Machine-readable JSON")
+end
+
 SUBCOMMAND_HELP["help"] = function()
     print("luallm help — Show help for commands")
     print()
@@ -540,6 +566,7 @@ function print_help(subcommand, flag)
             { name = "notes",       group = "management",  description = "Attach freeform notes to a model" },
             { name = "bench",       group = "benchmarking",description = "Benchmark a model using llama-bench" },
             { name = "recommend",   group = "benchmarking",description = "Generate optimised run presets" },
+            { name = "history",     group = "utilities",   description = "Show recently used models with run counts" },
             { name = "doctor",      group = "utilities",   description = "Run configuration diagnostics" },
             { name = "config",      group = "utilities",   description = "Show config file location" },
             { name = "rebuild",     group = "utilities",   description = "Rebuild llama.cpp from source" },
@@ -657,6 +684,7 @@ function print_help(subcommand, flag)
     print("  luallm recommend        Generate optimised run presets")
     print()
     print("UTILITIES:")
+    print("  luallm history          Show recently used models with run counts")
     print("  luallm doctor           Run configuration diagnostics")
     print("  luallm config           Show config file location")
     print("  luallm rebuild          Rebuild llama.cpp from source")
@@ -677,6 +705,7 @@ function print_help(subcommand, flag)
     print("  luallm help join        Merging multi-part GGUF files")
     print("  luallm help pin         Pinning models")
     print("  luallm help help        Help command options (--json output)")
+    print("  luallm help history     Show run history (--json output)")
     print()
     print("Config: " .. config.CONFIG_FILE)
     print()
