@@ -59,6 +59,7 @@ local doctor = require("doctor")
 local recommend = require("recommend")
 local join      = require("join")
 local state     = require("state")
+local hf        = require("hf")
 
 -- Main command dispatcher
 local function main(args)
@@ -119,6 +120,9 @@ local function main(args)
 
     elseif args[1] == "join" then
         join.handle_join_command(args, cfg)
+
+    elseif args[1] == "hf" then
+        hf.handle_hf_command(args, cfg)
 
     elseif args[1] == "status" then
         state.handle_status_command(args, cfg)
@@ -364,6 +368,33 @@ SUBCOMMAND_HELP["join"] = function()
     print("  luallm join llama-405b          # Merge a specific model by name")
 end
 
+SUBCOMMAND_HELP["hf"] = function()
+    print("luallm hf — Import recommended llama.cpp flags from a HuggingFace model card")
+    print()
+    print("USAGE:")
+    print("  luallm hf <url> [model]")
+    print()
+    print("  Fetches the model card README from HuggingFace, extracts any recommended")
+    print("  llama.cpp flags (via regex, then a local LLM if needed), shows a summary,")
+    print("  and — with your approval — saves them as a 'hf' preset and adds a note")
+    print("  linking back to the HuggingFace page.")
+    print()
+    print("  Flag extraction order:")
+    print("    1. Regex scan of the model card (fast, no inference required)")
+    print("    2. Local LLM query via running llama-server, or llama-cli as fallback")
+    print()
+    print("ARGUMENTS:")
+    print("  <url>    HuggingFace model page URL")
+    print("  [model]  Local model name (fuzzy match). Prompted if omitted.")
+    print()
+    print("EXAMPLES:")
+    print("  luallm hf https://huggingface.co/DavidAU/MN-Oblivion-26B-UNCENSORED-NEO-Imatrix-GGUF")
+    print("  luallm hf https://huggingface.co/mistralai/Mistral-7B-v0.1 mistral-7b.Q4_K_M.gguf")
+    print()
+    print("  After import, run with:")
+    print("    luallm run <model> --preset hf")
+end
+
 SUBCOMMAND_HELP["pin"] = function()
     print("luallm pin / unpin / pinned — Pin models for quick access")
     print()
@@ -564,6 +595,7 @@ function print_help(subcommand, flag)
             { name = "unpin",       group = "management",  description = "Unpin a model" },
             { name = "pinned",      group = "management",  description = "List all pinned models" },
             { name = "notes",       group = "management",  description = "Attach freeform notes to a model" },
+            { name = "hf",          group = "management",  description = "Import recommended flags from a HuggingFace model card" },
             { name = "bench",       group = "benchmarking",description = "Benchmark a model using llama-bench" },
             { name = "recommend",   group = "benchmarking",description = "Generate optimised run presets" },
             { name = "history",     group = "utilities",   description = "Show recently used models with run counts" },
@@ -678,6 +710,7 @@ function print_help(subcommand, flag)
     print("  luallm join [query]     Merge multi-part GGUF files")
     print("  luallm pin/unpin        Pin models for quick picker access")
     print("  luallm notes            Attach notes to a model")
+    print("  luallm hf <url>         Import recommended flags from a HuggingFace model card")
     print()
     print("BENCHMARKING & PRESETS:")
     print("  luallm bench <model>    Benchmark with llama-bench")
@@ -703,6 +736,7 @@ function print_help(subcommand, flag)
     print("  luallm help list        Listing models (--json output)")
     print("  luallm help info        Viewing model metadata")
     print("  luallm help join        Merging multi-part GGUF files")
+    print("  luallm help hf          Importing flags from HuggingFace model cards")
     print("  luallm help pin         Pinning models")
     print("  luallm help help        Help command options (--json output)")
     print("  luallm help history     Show run history (--json output)")
