@@ -3,6 +3,9 @@ local config = require("config")
 local format = require("format")
 local resolver = require("resolver")
 
+local json_ok, json = pcall(require, "cjson")
+if not json_ok then json = nil end
+
 local M = {}
 
 -- Lazy load picker to avoid circular dependency
@@ -74,6 +77,8 @@ function M.handle_pin_command(args, cfg)
     end
     
     local model_query = args[2]
+    local want_json = args[3] == "--json"
+    
     local model_name = resolver.resolve_or_exit(cfg, model_query, {
         title = "Select a model to pin (↑/↓ arrows, Enter to confirm, q to quit):",
         on_no_match = function(query)
@@ -98,7 +103,23 @@ function M.handle_pin_command(args, cfg)
         end
     })
     
-    if M.add_pin(model_name) then
+    local success = M.add_pin(model_name)
+    
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local entry = {
+            model = model_name,
+            pinned = success,
+            already_pinned = not success,
+        }
+        print(json.encode(entry))
+        return
+    end
+    
+    if success then
         print("Pinned: " .. model_name)
     else
         print("Already pinned: " .. model_name)
@@ -113,26 +134,51 @@ function M.handle_unpin_command(args, cfg)
     end
     
     local model_query = args[2]
+    local want_json = args[3] == "--json"
+    
     local model_name = resolver.resolve_or_exit(cfg, model_query, {
         title = "Select a model to unpin (↑/↓ arrows, Enter to confirm, q to quit):"
     })
     
-    if M.remove_pin(model_name) then
+    local success = M.remove_pin(model_name)
+    
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local entry = {
+            model = model_name,
+            unpinned = success,
+            was_pinned = success,
+        }
+        print(json.encode(entry))
+        return
+    end
+    
+    if success then
         print("Unpinned: " .. model_name)
     else
         print("Not pinned: " .. model_name)
     end
 end
 
-function M.handle_pinned_command(cfg)
+function M.handle_pinned_command(args, cfg)
+    local want_json = args[2] == "--json"
     local pins = M.load_pins()
     
     if #pins == 0 then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({}))
+            return
+        end
         print("No pinned models.")
         os.exit(0)
     end
-    
-    print("Pinned models:\n")
     
     local pin_data = {}
     for _, name in ipairs(pins) do
@@ -144,6 +190,26 @@ function M.handle_pinned_command(cfg)
             last_run_str = last_run_str
         })
     end
+    
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local out = {}
+        for _, m in ipairs(pin_data) do
+            table.insert(out, {
+                name = m.name,
+                size = m.size_str,
+                quantization = m.quant,
+                last_run = m.last_run_str
+            })
+        end
+        print(json.encode(out))
+        return
+    end
+    
+    print("Pinned models:\n")
     
     local max_name, max_size, max_quant = format.calculate_column_widths(pin_data)
     for _, m in ipairs(pin_data) do

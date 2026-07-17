@@ -344,7 +344,8 @@ local function next_free_port(base, occupied)
     return p
 end
 
-local function build_llama_command(config, model_name, extra_args, preset_flags)
+-- notices_to_stderr: set when stdout must stay machine-readable (--json mode)
+local function build_llama_command(config, model_name, extra_args, preset_flags, notices_to_stderr)
     local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
 
     local argv = {util.expand_path(config.llama_cpp_path), "-m", model_path}
@@ -425,8 +426,13 @@ local function build_llama_command(config, model_name, extra_args, preset_flags)
         local base = tonumber(config.default_port) or 8080
         local port = next_free_port(base, occupied_ports())
         if port ~= base then
-            print(string.format(
-                "Port %d already in use — starting on port %d instead", base, port))
+            local msg = string.format(
+                "Port %d already in use — starting on port %d instead", base, port)
+            if notices_to_stderr then
+                io.stderr:write(msg .. "\n")
+            else
+                print(msg)
+            end
         end
         table.insert(argv, "--port")
         table.insert(argv, tostring(port))
@@ -611,11 +617,29 @@ end
 
 -- Start a model as a background daemon (luallm start <model>).
 -- stdout/stderr go to a log file; PID is captured exactly via shell $!.
-function M.start_model_daemon(config, model_query, extra_args, preset_name)
-    if not model_query then
-        print("Error: missing model name")
-        print("Usage: luallm start <model> [--preset <profile>] [extra flags...]")
+function M.start_model_daemon(config, model_query, extra_args, preset_name, want_json)
+    -- In --json mode stdout must carry only the JSON payload: notices go
+    -- to stderr and failures are emitted as JSON error objects.
+    local function notice(msg)
+        if want_json then
+            io.stderr:write(msg .. "\n")
+        else
+            print(msg)
+        end
+    end
+    local function fail(code, message, extra_lines)
+        if want_json and json then
+            print(json.encode({error = code, message = message}))
+        else
+            print("Error: " .. message)
+            for _, line in ipairs(extra_lines or {}) do print(line) end
+        end
         os.exit(1)
+    end
+
+    if not model_query then
+        fail("missing_model", "missing model name",
+             {"Usage: luallm start <model> [--preset <profile>] [extra flags...]"})
     end
 
     local resolver = require("resolver")
@@ -625,8 +649,7 @@ function M.start_model_daemon(config, model_query, extra_args, preset_name)
 
     local model_path = util.expand_path(config.models_dir) .. "/" .. model_name .. ".gguf"
     if not util.file_exists(model_path) then
-        print("Error: Model file not found: " .. model_path)
-        os.exit(1)
+        fail("model_file_not_found", "Model file not found: " .. model_path)
     end
 
     local preset_flags = nil
@@ -634,28 +657,42 @@ function M.start_model_daemon(config, model_query, extra_args, preset_name)
         local recommend = require("recommend")
         local preset = recommend.load_preset(config, model_name, preset_name)
         if not preset then
-            print("Error: No '" .. preset_name .. "' preset found for " .. model_name)
-            print("Run: luallm recommend " .. preset_name .. " " .. model_name)
-            os.exit(1)
+            fail("preset_not_found", "No '" .. preset_name .. "' preset found for " .. model_name,
+                 {"Run: luallm recommend " .. preset_name .. " " .. model_name})
         end
         preset_flags = preset.flags
-        print("Using " .. preset_name .. " preset")
+        notice("Using " .. preset_name .. " preset")
     end
 
-    local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags)
+    local cmd, argv = build_llama_command(config, model_name, extra_args, preset_flags, want_json)
     local port = port_from_argv(argv)   -- always set; build_llama_command guarantees it
 
-    print("Starting daemon: " .. model_name)
+    notice("Starting daemon: " .. model_name)
 
     local state = require("state")
     local pid, log_path_or_err = state.launch_daemon(model_name, cmd, port)
 
     if not pid then
-        print("Error: " .. (log_path_or_err or "failed to start server"))
-        os.exit(1)
+        fail("start_failed", log_path_or_err or "failed to start server")
     end
 
     local log_path = log_path_or_err
+
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local result = {
+            model = model_name,
+            pid = pid,
+            port = port,
+            log_file = log_path,
+            status = "started",
+        }
+        print(json.encode(result))
+        return
+    end
 
     print(string.format("✓ Started  PID %d", pid))
     if port then
@@ -720,6 +757,7 @@ function M.handle_info_command(args, cfg)
     local model_query = nil
     local raw_mode = false
     local show_kv = false
+    local want_json = false
     
     -- Extract flags and model query from args
     for i = 2, #args do
@@ -727,6 +765,8 @@ function M.handle_info_command(args, cfg)
             raw_mode = true
         elseif args[i] == "--kv" then
             show_kv = true
+        elseif args[i] == "--json" then
+            want_json = true
         elseif not model_query then
             -- First non-flag argument is the model query
             model_query = args[i]
@@ -737,6 +777,27 @@ function M.handle_info_command(args, cfg)
     
     if not model_query then
         -- No model specified - show interactive picker
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            ensure_model_info_dir()
+            local models_with_info = {}
+            
+            if util.is_dir(M.MODEL_INFO_DIR) then
+                for file in lfs.dir(M.MODEL_INFO_DIR) do
+                    if file:match("%.json$") then
+                        local name = file:gsub("%.json$", "")
+                        table.insert(models_with_info, name)
+                    end
+                end
+            end
+            
+            print(json.encode(models_with_info))
+            return
+        end
+        
         ensure_model_info_dir()
         local models_with_info = {}
         
@@ -779,6 +840,14 @@ function M.handle_info_command(args, cfg)
     local info, status = M.load_model_info(model_name)
     
     if status == "no_cache" then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "no_cache", message = "No cached info for model: " .. model_name}))
+            return
+        end
         print("No cached info for model: " .. model_name)
         print("Run the model once to capture metadata:")
         print("  luallm " .. model_name)
@@ -786,9 +855,25 @@ function M.handle_info_command(args, cfg)
     end
     
     if status == "gguf_missing" then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "gguf_missing", message = "GGUF file no longer exists", model = model_name, info = info}))
+            return
+        end
         print("⚠ Warning: GGUF file no longer exists")
         print()
     elseif status == "stale" then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "stale", message = "Cache is stale (GGUF has been modified)", model = model_name, info = info}))
+            return
+        end
         print("⚠ Warning: Cache is stale (GGUF has been modified)")
         print("Run the model again to refresh cache:")
         print("  luallm " .. model_name)
@@ -799,13 +884,26 @@ function M.handle_info_command(args, cfg)
         local reason_str = info.end_reason == "sigint" and "interrupted by user" or
                          info.end_reason == "error" and "error during run" or
                          "non-zero exit"
-        print("⚠ Note: Partial capture (" .. reason_str .. ", exit code: " .. (info.exit_code or "unknown") .. ")")
-        print()
+        if want_json then
+            info._warning = "Partial capture (" .. reason_str .. ", exit code: " .. (info.exit_code or "unknown") .. ")"
+        else
+            print("⚠ Note: Partial capture (" .. reason_str .. ", exit code: " .. (info.exit_code or "unknown") .. ")")
+            print()
+        end
     end
     
     if info.kv and info.kv["_kv_parse_warning"] then
-        print("⚠ KV Parse Warning: " .. info.kv["_kv_parse_warning"])
-        print()
+        if want_json then
+            info._kv_parse_warning = info.kv["_kv_parse_warning"]
+        else
+            print("⚠ KV Parse Warning: " .. info.kv["_kv_parse_warning"])
+            print()
+        end
+    end
+    
+    if want_json then
+        print(json.encode(info))
+        return
     end
     
     if show_kv then

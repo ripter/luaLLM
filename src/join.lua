@@ -12,6 +12,9 @@
 local util   = require("util")
 local lfs    = require("lfs")
 
+local json_ok, json = pcall(require, "cjson")
+if not json_ok then json = nil end
+
 local M = {}
 
 -- ---------------------------------------------------------------------------
@@ -72,9 +75,24 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.handle_join_command(args, cfg)
+    local want_json = false
+    for i = 2, #args do
+        if args[i] == "--json" then
+            want_json = true
+        end
+    end
+    
     -- ── Locate llama-gguf-split ──────────────────────────────────────
     local split_path = util.resolve_gguf_split_path(cfg)
     if not split_path then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "split_not_found", message = "llama-gguf-split not found"}))
+            return
+        end
         print("Error: llama-gguf-split not found.")
         print("Add one of the following to your config:")
         print("  llama_gguf_split_path  — explicit path to llama-gguf-split")
@@ -89,6 +107,14 @@ function M.handle_join_command(args, cfg)
     local groups = find_multipart_groups(models_dir)
 
     if #groups == 0 then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({groups = {}}))
+            return
+        end
         print("No multi-part GGUF files found in: " .. models_dir)
         print()
         print("Multi-part files use names like:")
@@ -100,6 +126,10 @@ function M.handle_join_command(args, cfg)
 
     -- ── Filter by user query if provided ────────────────────────────
     local query = args[2]
+    if query == "--json" then
+        query = nil  -- --json is not a model query
+    end
+    
     local targets = {}
 
     if query then
@@ -110,6 +140,14 @@ function M.handle_join_command(args, cfg)
             end
         end
         if #targets == 0 then
+            if want_json then
+                if not json then
+                    io.stderr:write("Error: cjson not available for JSON output\n")
+                    os.exit(1)
+                end
+                print(json.encode({error = "not_found", query = query, available = groups}))
+                return
+            end
             print("No multi-part model matching: " .. query)
             print()
             print("Available multi-part models:")
@@ -127,6 +165,22 @@ function M.handle_join_command(args, cfg)
     if #targets == 1 then
         group = targets[1]
     else
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            local groups_json = {}
+            for _, g in ipairs(targets) do
+                table.insert(groups_json, {
+                    base = g.base,
+                    total = g.total,
+                    parts = g.parts
+                })
+            end
+            print(json.encode({message = "Multiple multi-part models found", groups = groups_json}))
+            return
+        end
         print("Multiple multi-part models found:")
         print()
         for i, g in ipairs(targets) do
@@ -148,9 +202,6 @@ function M.handle_join_command(args, cfg)
     end
 
     -- ── Confirm all parts are present ───────────────────────────────
-    print(string.format("Joining: %s  (%d parts)", group.base, group.total))
-    print()
-
     local missing = {}
     for i = 1, group.total do
         if not group.parts[i] then
@@ -160,6 +211,14 @@ function M.handle_join_command(args, cfg)
     end
 
     if #missing > 0 then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "missing_parts", missing = missing, model = group.base}))
+            return
+        end
         print("Error: missing parts:")
         for _, f in ipairs(missing) do
             print("  " .. f)
@@ -178,6 +237,14 @@ function M.handle_join_command(args, cfg)
     local output_path = group.dir .. "/" .. output_file
 
     if util.file_exists(output_path) then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "exists", output_file = output_file, model = group.base}))
+            return
+        end
         print("Warning: output file already exists: " .. output_file)
         io.write("Overwrite? [y/N]: ")
         io.flush()
@@ -205,6 +272,14 @@ function M.handle_join_command(args, cfg)
 
     local handle = io.popen(cmd)
     if not handle then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "launch_failed", model = group.base}))
+            return
+        end
         print("Error: failed to launch llama-gguf-split")
         os.exit(1)
     end
@@ -218,9 +293,34 @@ function M.handle_join_command(args, cfg)
     local exit_code = util.normalize_exit_code(ok, why, code)
 
     if exit_code ~= 0 then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "merge_failed", exit_code = exit_code, model = group.base}))
+            return
+        end
         print()
         print(string.format("Error: llama-gguf-split exited with code %d", exit_code))
         os.exit(1)
+    end
+
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local attr = util.path_attr(output_path)
+        print(json.encode({
+            success = true,
+            model = group.base,
+            output_file = output_file,
+            output_path = output_path,
+            parts_merged = group.total,
+            output_size_bytes = attr and attr.size or nil,
+        }))
+        return
     end
 
     print()

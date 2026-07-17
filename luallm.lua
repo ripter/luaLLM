@@ -104,7 +104,7 @@ local function main(args)
         pins.handle_unpin_command(args, cfg)
         
     elseif args[1] == "pinned" then
-        pins.handle_pinned_command(cfg)
+        pins.handle_pinned_command(args, cfg)
         
     elseif args[1] == "notes" then
         notes.handle_notes_command(args, cfg)
@@ -113,7 +113,7 @@ local function main(args)
         bench.handle_bench_command(args, cfg)
         
     elseif args[1] == "doctor" then
-        doctor.run(cfg)
+        doctor.run(cfg, args)
         
     elseif args[1] == "recommend" then
         recommend.handle_recommend_command(args, cfg)
@@ -134,27 +134,30 @@ local function main(args)
         -- Background daemon launch with optional --preset support
         if #args < 2 then
             print("Error: missing model name")
-            print("Usage: luallm start <model> [--preset <profile>] [...extra args]")
+            print("Usage: luallm start <model> [--preset <profile>] [--json] [...extra args]")
             os.exit(1)
         end
         local model_query = args[2]
         if model_query:sub(1,1) == "-" then
             print("Error: expected a model name but got a flag: " .. model_query)
             print("The model name must come first.")
-            print("Usage: luallm start <model> [--preset <profile>] [...extra args]")
+            print("Usage: luallm start <model> [--preset <profile>] [--json] [...extra args]")
             os.exit(1)
         end
         local preset_name = nil
         local extra_args = {}
+        local want_json = false
         local i = 3
         while i <= #args do
             if args[i] == "--preset" and args[i+1] then
                 preset_name = args[i+1]; i = i + 2
+            elseif args[i] == "--json" then
+                want_json = true; i = i + 1
             else
                 table.insert(extra_args, args[i]); i = i + 1
             end
         end
-        model_info.start_model_daemon(cfg, model_query, extra_args, preset_name)
+        model_info.start_model_daemon(cfg, model_query, extra_args, preset_name, want_json)
 
     elseif args[1] == "logs" then
         state.handle_logs_command(args, cfg)
@@ -347,7 +350,7 @@ SUBCOMMAND_HELP["join"] = function()
     print("luallm join — Merge multi-part GGUF files into a single file")
     print()
     print("USAGE:")
-    print("  luallm join [query]")
+    print("  luallm join [query] [--json]")
     print()
     print("  Scans your models directory for files matching the multi-part naming")
     print("  convention and merges them using llama-gguf-split --merge.")
@@ -363,9 +366,13 @@ SUBCOMMAND_HELP["join"] = function()
     print("  It is found automatically if llama_cpp_path is configured.")
     print("  You can also set llama_gguf_split_path explicitly in config.")
     print()
+    print("OPTIONS:")
+    print("  --json    Output join results as JSON (skips interactive prompts)")
+    print()
     print("EXAMPLES:")
     print("  luallm join                     # Find and merge any multi-part GGUFs")
     print("  luallm join llama-405b          # Merge a specific model by name")
+    print("  luallm join --json              # List available groups as JSON")
 end
 
 SUBCOMMAND_HELP["hf"] = function()
@@ -405,17 +412,21 @@ SUBCOMMAND_HELP["pin"] = function()
     print()
     print("  Pinned models appear at the top of the interactive picker.")
     print()
+    print("OPTIONS:")
+    print("  --json    Output as JSON array (for scripting)")
+    print()
     print("EXAMPLES:")
     print("  luallm pin mistral              # Pin a model")
     print("  luallm unpin mistral            # Unpin a model")
     print("  luallm pinned                   # List all pinned models")
+    print("  luallm pinned --json            # List as JSON")
 end
 
 SUBCOMMAND_HELP["start"] = function()
     print("luallm start — Start a model as a background daemon")
     print()
     print("USAGE:")
-    print("  luallm start <model> [--preset <profile>] [extra llama.cpp flags...]")
+    print("  luallm start <model> [--preset <profile>] [--json] [extra llama.cpp flags...]")
     print()
     print("  Launches llama-server in the background and returns immediately.")
     print("  The model name must come before any flags.")
@@ -429,6 +440,7 @@ SUBCOMMAND_HELP["start"] = function()
     print()
     print("OPTIONS:")
     print("  --preset <profile>   Load saved preset flags  (throughput, cold-start)")
+    print("  --json               Output start status as JSON")
     print()
     print("EXAMPLES:")
     print("  luallm start mistral                        # Start with default settings")
@@ -608,13 +620,17 @@ function print_help(subcommand, flag)
         -- Options per command
         local options = {
             run       = { { flag = "--preset <profile>", description = "Load saved preset flags (throughput, cold-start, context)" } },
-            start     = { { flag = "--preset <profile>", description = "Load saved preset flags" } },
+            start     = { { flag = "--preset <profile>", description = "Load saved preset flags" },
+                          { flag = "--json",            description = "Output start status as JSON" } },
+            stop      = { { flag = "--json", description = "Output stop status as JSON" } },
             status    = { { flag = "--json",             description = "Output raw state as JSON" } },
-            logs      = { { flag = "--follow, -f",       description = "Tail the log in real time" } },
+            logs      = { { flag = "--follow, -f",       description = "Tail the log in real time" },
+                          { flag = "--json",            description = "Output log info as JSON" } },
             list      = { { flag = "--json",             description = "Output model list as JSON" } },
             info      = {
                 { flag = "--kv",  description = "Show GGUF key-value pairs" },
                 { flag = "--raw", description = "Show raw captured llama.cpp output" },
+                { flag = "--json", description = "Output as JSON" },
             },
             bench     = {
                 { flag = "--n <N>",        description = "Number of benchmark runs (default: 5)" },
@@ -624,6 +640,11 @@ function print_help(subcommand, flag)
             },
             notes     = { { flag = "--json", description = "Output notes as JSON" } },
             help      = { { flag = "--json", description = "Output help as JSON" } },
+            pin       = { { flag = "--json", description = "Output pin status as JSON" } },
+            unpin     = { { flag = "--json", description = "Output unpin status as JSON" } },
+            pinned    = { { flag = "--json", description = "Output pinned models as JSON" } },
+            join      = { { flag = "--json", description = "Output join results as JSON" } },
+            doctor    = { { flag = "--json", description = "Output diagnostics as JSON" } },
         }
 
         -- Subcommands per command
@@ -638,6 +659,15 @@ function print_help(subcommand, flag)
                 { name = "edit [model]",            description = "Open notes file in $EDITOR" },
                 { name = "list",                    description = "List all models that have notes" },
                 { name = "path <model>",            description = "Print the path to the notes file" },
+            },
+            pin = {
+                { name = "<model>",                 description = "Pin a model" },
+            },
+            unpin = {
+                { name = "<model>",                 description = "Unpin a model" },
+            },
+            pinned = {
+                { name = "",                        description = "List all pinned models" },
             },
         }
 
@@ -727,19 +757,22 @@ function print_help(subcommand, flag)
     print("DETAILED HELP:")
     print("  luallm help run         Running models with presets and flags")
     print("  luallm help start       Background daemon launch, PID tracking, log files")
-    print("  luallm help logs        Viewing daemon server logs")
     print("  luallm help stop        Stopping a running server")
     print("  luallm help status      Checking server state (--json output)")
+    print("  luallm help logs        Viewing daemon server logs (--json output)")
     print("  luallm help bench       Benchmarking and comparing models")
     print("  luallm help recommend   Generating optimised presets")
     print("  luallm help notes       Attaching notes to models (--json output)")
     print("  luallm help list        Listing models (--json output)")
-    print("  luallm help info        Viewing model metadata")
-    print("  luallm help join        Merging multi-part GGUF files")
+    print("  luallm help info        Viewing model metadata (--json output)")
+    print("  luallm help join        Merging multi-part GGUF files (--json output)")
     print("  luallm help hf          Importing flags from HuggingFace model cards")
-    print("  luallm help pin         Pinning models")
+    print("  luallm help pin         Pinning models (--json output)")
+    print("  luallm help unpin       Unpinning models (--json output)")
+    print("  luallm help pinned      Listing pinned models (--json output)")
     print("  luallm help help        Help command options (--json output)")
     print("  luallm help history     Show run history (--json output)")
+    print("  luallm help doctor      Run configuration diagnostics (--json output)")
     print()
     print("Config: " .. config.CONFIG_FILE)
     print()

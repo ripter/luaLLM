@@ -427,7 +427,41 @@ return { run = function()
         T.assert_eq(found_summary, true, "summary line printed")
     end
 
-    -- ── 14. stop all: graceful when nothing running ───────────────────────
+    -- ── 14. stop all: clears status for models with no PID ─────────────────
+    do
+        local s, _, _, restore = setup()
+
+        s.mark_running("orphan-model", 8080, "daemon")
+        -- Don't call update_pid - pid remains json.null
+
+        local output = T.capture_print(function()
+            s.handle_stop_command({ "stop", "all" }, {})
+        end)
+        restore()
+
+        -- orphan-model should be marked stopped even though no PID was found
+        T.assert_eq(s.is_running("orphan-model"), nil, "orphan-model marked stopped despite no PID")
+    end
+
+    -- ── 15. stop: marks stopped when no PID found ───────────────────────────
+    do
+        local s, _, _, restore = setup()
+
+        s.mark_running("no-pid-model", 8080, "daemon")
+        -- Don't call update_pid - pid remains json.null
+
+        local restore_exit = stub_exit()
+        local output = T.capture_print(function()
+            s.handle_stop_command({ "stop", "no-pid-model" }, {})
+        end)
+        restore_exit()
+        restore()
+
+        -- entry should be marked stopped even though no PID was found
+        T.assert_eq(s.is_running("no-pid-model"), nil, "model marked stopped despite no PID")
+    end
+
+    -- ── 16. stop all: graceful when nothing running ───────────────────────
     do
         local s, _, _, restore = setup()
         restore()
@@ -443,7 +477,7 @@ return { run = function()
         T.assert_eq(found, true, "no-servers message shown")
     end
 
-    -- ── 15. stop: no match shows running list ────────────────────────────
+    -- ── 17. stop: no match shows running list ────────────────────────────
     do
         local s, _, _, restore = setup()
 
@@ -468,7 +502,7 @@ return { run = function()
         T.assert_eq(found_visible,  true, "lists available running servers")
     end
 
-    -- ── 16. status: human-readable shows running servers ─────────────────
+    -- ── 18. status: human-readable shows running servers ─────────────────
     do
         local s, _, _, restore = setup()
 
@@ -489,7 +523,7 @@ return { run = function()
         T.assert_eq(found, true, "status shows model, port, and pid")
     end
 
-    -- ── 17. status --json: valid JSON with correct schema ────────────────
+    -- ── 19. status --json: valid JSON with correct schema ────────────────
     do
         local s, _, _, restore = setup()
 
@@ -513,7 +547,7 @@ return { run = function()
         T.assert_eq(decoded.servers[2].state, "stopped",    "second entry stopped")
     end
 
-    -- ── 18. status: empty state shows helpful message ─────────────────────
+    -- ── 20. status: empty state shows helpful message ─────────────────────
     do
         local s, _, _, restore = setup()
         restore()
@@ -529,7 +563,7 @@ return { run = function()
         T.assert_eq(found, true, "empty state message shown")
     end
 
-    -- ── 19. get_state: returns empty structure when no file ───────────────
+    -- ── 21. get_state: returns empty structure when no file ───────────────
     do
         local s, _, _, restore = setup()
         restore()
@@ -540,7 +574,7 @@ return { run = function()
         T.assert_eq(#data.servers,  0,     "no servers initially")
     end
 
-    -- ── 20. multiple models coexist independently ─────────────────────────
+    -- ── 22. multiple models coexist independently ─────────────────────────
     do
         local s, store, _, restore = setup()
         restore()

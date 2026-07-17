@@ -280,12 +280,12 @@ local function _stop_one(entry)
             os.execute(string.format("kill -KILL %d 2>/dev/null", pid))
         end
         os.remove(pid_file_for(entry.model))
+        M.mark_stopped(entry.model, 0)
+        return true
     else
+        M.mark_stopped(entry.model, 0)
         return false, "no PID found"
     end
-
-    M.mark_stopped(entry.model, 0)
-    return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -304,7 +304,16 @@ local function find_running_entry(model_query)
 end
 
 function M.handle_stop_command(args, cfg)
-    local model_query = args[2]
+    local model_query = nil
+    local want_json = false
+    
+    for i = 2, #args do
+        if args[i] == "--json" then
+            want_json = true
+        else
+            model_query = args[i]
+        end
+    end
 
     -- "stop all" — stop every running server
     if model_query and model_query:lower() == "all" then
@@ -315,7 +324,46 @@ function M.handle_stop_command(args, cfg)
         end
 
         if #running == 0 then
+            if want_json then
+                if not json then
+                    io.stderr:write("Error: cjson not available for JSON output\n")
+                    os.exit(1)
+                end
+                print(json.encode({stopped = {}, message = "No servers are currently running."}))
+                return
+            end
             print("No servers are currently running.")
+            return
+        end
+
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            local stopped = {}
+            local failed = 0
+            for _, entry in ipairs(running) do
+                local ok, err = _stop_one(entry)
+                if not ok then
+                    failed = failed + 1
+                    table.insert(stopped, {
+                        model = entry.model,
+                        success = false,
+                        error = err or "unknown error"
+                    })
+                else
+                    table.insert(stopped, {
+                        model = entry.model,
+                        success = true
+                    })
+                end
+            end
+            print(json.encode({
+                stopped = stopped,
+                total = #running,
+                failed = failed
+            }))
             return
         end
 
@@ -342,6 +390,14 @@ function M.handle_stop_command(args, cfg)
 
     -- "stop <model>"
     if not model_query then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "missing_model", message = "Missing model name", usage = "luallm stop <model>"}))
+            return
+        end
         print("Error: missing model name")
         print("Usage: luallm stop <model> | all")
         os.exit(1)
@@ -349,6 +405,23 @@ function M.handle_stop_command(args, cfg)
 
     local entry = find_running_entry(model_query)
     if not entry then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            local data = load_state()
+            local running = {}
+            for _, e in ipairs(data.servers) do
+                if e.state == "running" then table.insert(running, e.model) end
+            end
+            print(json.encode({
+                error = "not_running",
+                model = model_query,
+                running_servers = running
+            }))
+            return
+        end
         print("No running server found matching: " .. model_query)
         local data = load_state()
         local running = {}
@@ -364,6 +437,19 @@ function M.handle_stop_command(args, cfg)
     end
 
     local ok, err = _stop_one(entry)
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        print(json.encode({
+            model = entry.model,
+            success = ok,
+            error = err
+        }))
+        return
+    end
+    
     if not ok then
         print("Warning: " .. (err or "could not send signal"))
         print("If the server is still running, stop it manually.")
@@ -442,9 +528,13 @@ end
 function M.handle_logs_command(args, cfg)
     local model_query = nil
     local follow = false
+    local want_json = false
+    
     for i = 2, #args do
         if args[i] == "--follow" or args[i] == "-f" then
             follow = true
+        elseif args[i] == "--json" then
+            want_json = true
         elseif args[i]:sub(1, 1) ~= "-" and not model_query then
             model_query = args[i]
         end
@@ -460,12 +550,31 @@ function M.handle_logs_command(args, cfg)
             end
         end
         if #candidates == 0 then
+            if want_json then
+                print(json.encode({logs = {}}))
+                return
+            end
             print("No log files found.")
             print("Logs are created when you use: luallm start <model>")
             os.exit(0)
         elseif #candidates == 1 then
             model_query = candidates[1].model
         else
+            if want_json then
+                if not json then
+                    io.stderr:write("Error: cjson not available for JSON output\n")
+                    os.exit(1)
+                end
+                local logs = {}
+                for _, e in ipairs(candidates) do
+                    table.insert(logs, {
+                        model = e.model,
+                        log_file = e.log_file,
+                    })
+                end
+                print(json.encode({logs = logs}))
+                return
+            end
             print("Multiple log files available:")
             for i, e in ipairs(candidates) do
                 print(string.format("  [%d] %s", i, e.model))
@@ -493,9 +602,34 @@ function M.handle_logs_command(args, cfg)
     log_path = log_path or M.log_file_for(model_query)
 
     if not util.file_exists(log_path) then
+        if want_json then
+            if not json then
+                io.stderr:write("Error: cjson not available for JSON output\n")
+                os.exit(1)
+            end
+            print(json.encode({error = "not_found", model = model_query, expected_path = log_path}))
+            return
+        end
         print("No log file found for: " .. model_query)
         print("Expected: " .. log_path)
         os.exit(1)
+    end
+
+    if want_json then
+        if not json then
+            io.stderr:write("Error: cjson not available for JSON output\n")
+            os.exit(1)
+        end
+        local attr = util.path_attr(log_path)
+        local log_info = {
+            model = model_query,
+            log_file = log_path,
+            exists = true,
+            size_bytes = attr and attr.size or nil,
+            modified = attr and attr.modification or nil,
+        }
+        print(json.encode(log_info))
+        return
     end
 
     if follow then

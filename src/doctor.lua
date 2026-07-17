@@ -1,10 +1,13 @@
 -- doctor.lua
 -- Diagnostics and configuration validation for luaLLM
 
-local util = require("src.util")
-local config = require("src.config")
-local model_info = require("src.model_info")
-local history = require("src.history")
+local util = require("util")
+local config = require("config")
+local model_info = require("model_info")
+local history = require("history")
+
+local json_ok, json = pcall(require, "cjson")
+if not json_ok then json = nil end
 
 local M = {}
 
@@ -251,8 +254,90 @@ local function print_issues_summary(issues)
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 end
 
+-- JSON output for diagnostics
+local function doctor_json_output(cfg, issues, deps_ok)
+    if not json then
+        io.stderr:write("Error: cjson not available for JSON output\n")
+        os.exit(1)
+    end
+    
+    local output = {
+        config_file = config.CONFIG_FILE,
+        dependencies = {
+            lua_cjson = deps_ok and (pcall(require, "cjson") and "ok" or "missing"),
+            luafilesystem = deps_ok and (pcall(require, "lfs") and "ok" or "missing"),
+        },
+        config_exists = util.file_exists(config.CONFIG_FILE),
+        config_valid = false,
+        issues = {},
+    }
+    
+    if util.file_exists(config.CONFIG_FILE) then
+        local loaded_cfg, err = util.load_json(config.CONFIG_FILE)
+        if loaded_cfg then
+            output.config_valid = true
+            output.config = loaded_cfg
+        end
+    end
+    
+    for _, issue in ipairs(issues) do
+        table.insert(output.issues, issue.issue)
+    end
+    
+    print(json.encode(output))
+end
+
 -- Main doctor command handler
-function M.run(cfg)
+function M.run(cfg, args)
+    local want_json = args and args[2] == "--json"
+    
+    if want_json then
+        local issues = {}
+        local deps_ok = true
+        
+        -- Check Lua dependencies
+        local has_cjson = pcall(require, "cjson")
+        local has_lfs = pcall(require, "lfs")
+        
+        if not has_cjson then deps_ok = false end
+        if not has_lfs then deps_ok = false end
+        
+        -- Check config file
+        local loaded_cfg = nil
+        if util.file_exists(config.CONFIG_FILE) then
+            loaded_cfg = util.load_json(config.CONFIG_FILE)
+        end
+        
+        -- Validate required fields
+        if loaded_cfg then
+            for _, field in ipairs({
+                {path = "llama_cpp_path", check = "file"},
+                {path = "models_dir", check = "dir"},
+                {path = "bench.default_n", check = "number"},
+                {path = "bench.default_warmup", check = "number"},
+                {path = "bench.default_threads", check = "number"},
+            }) do
+                local value = loaded_cfg[field.path:match("([^.]+)")]
+                if field.check == "file" then
+                    if not value or not util.file_exists(util.expand_path(value)) then
+                        table.insert(issues, {field = field.path, issue = "file_not_found"})
+                    end
+                elseif field.check == "dir" then
+                    if not value or not util.is_dir(util.expand_path(value)) then
+                        table.insert(issues, {field = field.path, issue = "dir_not_found"})
+                    end
+                elseif field.check == "number" then
+                    if not value or type(value) ~= "number" then
+                        table.insert(issues, {field = field.path, issue = "wrong_type"})
+                    end
+                end
+            end
+        end
+        
+        doctor_json_output(loaded_cfg, issues, deps_ok)
+        return
+    end
+    
     print("luaLLM diagnostics")
     print()
     
